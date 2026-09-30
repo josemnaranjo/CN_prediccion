@@ -570,14 +570,15 @@ def procesar_sku(kopr: str, g: pd.DataFrame, cfg: Config = CONFIG) -> dict | Non
     m_acum, bloques = mape_bloques(bloques_limpios)
     mae = float(np.abs(reales.values - pred_backtest.values).mean())
 
-    # Sin stock ahora mismo: no tiene sentido mostrarle una proyección al
-    # usuario, porque el modelo estima demanda y el producto no está.
+    # Sin stock en la última semana cerrada. La proyección se genera igual
+    # —estima demanda, que existe aunque no haya producto— pero el dashboard
+    # debe advertirlo: esa demanda no se va a concretar si no se repone.
     en_quiebre = bool(cens_test[-1]) if len(cens_test) else False
 
     return {
         "kopr": kopr,
         "backtest": pred_backtest,
-        "proyeccion": None if en_quiebre else proyectar_arima(serie, cfg),
+        "proyeccion": proyectar_arima(serie, cfg),
         "metricas": {
             "semanas_backtest": int(len(pred_backtest)),
             "semanas_para_mape": int(((reales.values != 0) & ~cens_test).sum()),
@@ -731,7 +732,7 @@ def resumen(resultados: list[dict], cfg: Config) -> None:
     quiebre = m.loc[m["en_quiebre"], "kopr"].tolist()
     log.info("  Semanas censuradas por quiebre en el backtest: %d", cens)
     if quiebre:
-        log.warning("  SKUs sin stock al cierre, sin proyección: %s",
+        log.warning("  SKUs sin stock al cierre (el dashboard debe advertirlo): %s",
                     ", ".join(quiebre))
 
 
