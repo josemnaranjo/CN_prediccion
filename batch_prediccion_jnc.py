@@ -88,6 +88,16 @@ class Config:
     min_criterios: int = 2
     tratar_inferiores: bool = False  # los atípicos bajos son quiebres de stock
 
+    # --- Detección de quiebres de stock -------------------------------------
+    # Una semana se marca como censurada cuando su demanda cae por debajo de
+    # `umbral_censura` veces la mediana de las semanas previas. Reemplaza la
+    # detección del estudio (rachas de 3+ semanas en cero exacto confirmadas a
+    # mano por el Jefe de Ventas), que no capturaba las semanas con 1 o 2
+    # unidades ni los quiebres cortos.
+    umbral_censura: float = 0.10
+    ventana_censura: int = 13        # semanas previas para la mediana de referencia
+    min_ventas_censura: float = 10.0  # si la mediana previa es menor, no se evalúa
+
     # --- Operación ----------------------------------------------------------
     skus: tuple[str, ...] = SKUS_TESIS
     bloque_acumulado: int = 4        # tamaño del bloque para el MAPE acumulado
@@ -381,6 +391,40 @@ def winsorizar(datos: pd.DataFrame, cfg: Config = CONFIG) -> pd.DataFrame:
     return pd.concat(partes, ignore_index=True)
 
 
+def marcar_censuradas(datos: pd.DataFrame, cfg: Config = CONFIG) -> pd.DataFrame:
+    """Marca las semanas cuya demanda parece censurada por falta de stock.
+
+    En esas semanas lo observado no es la demanda: es lo que alcanzó a
+    venderse antes de que se acabara el producto. Medir el error contra ellas
+    castiga al modelo por un acierto — predijo demanda y no hubo qué vender.
+
+    El criterio es relativo al propio SKU: la semana se marca si su demanda es
+    menor que `umbral_censura` veces la mediana de las `ventana_censura`
+    semanas anteriores. Solo se mira hacia atrás, así que la marca de una
+    semana no cambia cuando llegan semanas nuevas.
+
+    La marca NO altera la serie que alimenta al modelo. El estudio dejó los
+    ceros de los quiebres dentro de la serie de entrenamiento y solo los
+    excluyó del cálculo de variabilidad; mantener ese criterio evita cambiar
+    un método ya validado. Lo que sí hace la marca es sacar esas semanas del
+    MAPE y avisarle al dashboard que no muestre proyección de un producto que
+    hoy está sin stock.
+    """
+    partes = []
+    for _, g in datos.groupby("kopr", sort=False):
+        g = g.sort_values("semana").copy()
+        referencia = (g["demanda"].shift(1)
+                      .rolling(cfg.ventana_censura, min_periods=4).median())
+        g["mediana_previa"] = referencia
+        g["censurada"] = (
+            referencia.notna()
+            & (referencia >= cfg.min_ventas_censura)
+            & (g["demanda"] < cfg.umbral_censura * referencia)
+        )
+        partes.append(g)
+    return pd.concat(partes, ignore_index=True)
+
+
 # ============================================================================
 # Modelo
 # ============================================================================
@@ -465,10 +509,16 @@ def proyectar_arima(serie: pd.Series, cfg: Config = CONFIG) -> pd.DataFrame:
 # Métricas
 # ============================================================================
 
-def mape(y: np.ndarray, yhat: np.ndarray) -> float:
-    """MAPE excluyendo las semanas con demanda cero, donde no está definido."""
+def mape(y: np.ndarray, yhat: np.ndarray, excluir: np.ndarray | None = None) -> float:
+    """MAPE excluyendo las semanas con demanda cero y las marcadas en `excluir`.
+
+    En cero el error relativo no está definido. Las excluidas son las semanas
+    censuradas por quiebre de stock, donde lo observado no es la demanda.
+    """
     y, yhat = np.asarray(y, float), np.asarray(yhat, float)
     ok = np.isfinite(y) & np.isfinite(yhat) & (y != 0)
+    if excluir is not None:
+        ok &= ~np.asarray(excluir, bool)
     if not ok.any():
         return float("nan")
     return float(np.abs((y[ok] - yhat[ok]) / y[ok]).mean() * 100)
@@ -503,24 +553,40 @@ def procesar_sku(kopr: str, g: pd.DataFrame, cfg: Config = CONFIG) -> dict | Non
                     kopr, len(serie), minimo)
         return None
 
+    censurada = (pd.Series(g["censurada"].values, index=list(g["semana"]))
+                 if "censurada" in g else pd.Series(False, index=serie.index))
+
     pred_backtest, bloques_pron = backtest_arima(serie, cfg)
     reales = serie.loc[pred_backtest.index]
+    cens_test = censurada.loc[pred_backtest.index].to_numpy(bool)
 
-    m_sem = mape(reales.values, pred_backtest.values)
-    m_acum, bloques = mape_bloques(bloques_pron)
+    # Un bloque acumulado se descarta completo si alguna de sus semanas está
+    # censurada: su suma tampoco representa la demanda del período.
+    B = cfg.bloque_acumulado
+    bloques_limpios = [b for i, b in enumerate(bloques_pron)
+                       if not cens_test[i * B:(i + 1) * B].any()]
+
+    m_sem = mape(reales.values, pred_backtest.values, excluir=cens_test)
+    m_acum, bloques = mape_bloques(bloques_limpios)
     mae = float(np.abs(reales.values - pred_backtest.values).mean())
+
+    # Sin stock ahora mismo: no tiene sentido mostrarle una proyección al
+    # usuario, porque el modelo estima demanda y el producto no está.
+    en_quiebre = bool(cens_test[-1]) if len(cens_test) else False
 
     return {
         "kopr": kopr,
         "backtest": pred_backtest,
-        "proyeccion": proyectar_arima(serie, cfg),
+        "proyeccion": None if en_quiebre else proyectar_arima(serie, cfg),
         "metricas": {
             "semanas_backtest": int(len(pred_backtest)),
-            "semanas_para_mape": int((reales.values != 0).sum()),
+            "semanas_para_mape": int(((reales.values != 0) & ~cens_test).sum()),
+            "semanas_censuradas": int(cens_test.sum()),
             "mape_semanal": m_sem,
             "mae_semanal": mae,
             "mape_4sem": m_acum,
             "bloques_4sem": bloques,
+            "en_quiebre": en_quiebre,
         },
     }
 
@@ -592,7 +658,8 @@ def guardar_serie(conn, batch_id: int, filas: list[tuple]) -> None:
         execute_values(cur, """
             INSERT INTO predictions.serie_semanal
                 (batch_run_id, kopr, semana, tipo, unidades,
-                 unidades_inf, unidades_sup, unidades_crudas, fue_tratada)
+                 unidades_inf, unidades_sup, unidades_crudas, fue_tratada,
+                 censurada)
             VALUES %s
         """, [(batch_id, *f) for f in filas], page_size=1000)
     conn.commit()
@@ -604,13 +671,15 @@ def guardar_metricas(conn, batch_id: int, metricas: list[dict]) -> None:
     if not metricas:
         return
     filas = [(batch_id, m["kopr"], m["semanas_backtest"], m["semanas_para_mape"],
-              _nulo(m["mape_semanal"]), _nulo(m["mae_semanal"]),
-              _nulo(m["mape_4sem"]), m["bloques_4sem"]) for m in metricas]
+              m["semanas_censuradas"], _nulo(m["mape_semanal"]),
+              _nulo(m["mae_semanal"]), _nulo(m["mape_4sem"]),
+              m["bloques_4sem"], m["en_quiebre"]) for m in metricas]
     with conn.cursor() as cur:
         execute_values(cur, """
             INSERT INTO predictions.metrica_sku
                 (batch_run_id, kopr, semanas_backtest, semanas_para_mape,
-                 mape_semanal, mae_semanal, mape_4sem, bloques_4sem)
+                 semanas_censuradas, mape_semanal, mae_semanal, mape_4sem,
+                 bloques_4sem, en_quiebre)
             VALUES %s
         """, filas)
     conn.commit()
@@ -623,18 +692,20 @@ def armar_filas_serie(tratado: pd.DataFrame, resultados: list[dict]) -> list[tup
     for r in tratado.itertuples():
         filas.append((r.kopr, r.semana, "real", round(float(r.demanda), 2),
                       None, None, round(float(r.demanda_cruda), 2),
-                      bool(r.fue_tratada)))
+                      bool(r.fue_tratada), bool(getattr(r, "censurada", False))))
 
     for res in resultados:
         for semana, valor in res["backtest"].items():
             if np.isfinite(valor):
                 filas.append((res["kopr"], semana, "backtest",
-                              round(float(valor), 2), None, None, None, None))
+                              round(float(valor), 2), None, None, None, None, None))
+        if res["proyeccion"] is None:   # SKU sin stock: no se proyecta
+            continue
         for p in res["proyeccion"].itertuples():
             filas.append((res["kopr"], p.semana, "proyeccion",
                           round(float(p.unidades), 2),
                           round(float(p.unidades_inf), 2),
-                          round(float(p.unidades_sup), 2), None, None))
+                          round(float(p.unidades_sup), 2), None, None, None))
     return filas
 
 
@@ -647,12 +718,21 @@ def resumen(resultados: list[dict], cfg: Config) -> None:
         log.warning("No hubo SKUs procesados.")
         return
     m = pd.DataFrame([r["metricas"] | {"kopr": r["kopr"]} for r in resultados])
+    # Se reporta la mediana y no la media: con MAPE, un solo SKU de demanda
+    # baja distorsiona el promedio en un orden de magnitud.
     log.info("Resumen del backtest (%d semanas por SKU):", cfg.semanas_backtest)
-    log.info("  MAPE semanal  — mediana %.2f%% | media %.2f%%",
-             m["mape_semanal"].median(), m["mape_semanal"].mean())
-    log.info("  MAPE %d semanas — mediana %.2f%% | SKUs <= 20%%: %d de %d",
+    log.info("  MAPE semanal    — mediana %.2f%% | SKUs sobre 100%%: %d de %d",
+             m["mape_semanal"].median(), int((m["mape_semanal"] > 100).sum()), len(m))
+    log.info("  MAPE %d semanas  — mediana %.2f%% | SKUs <= 20%%: %d de %d",
              cfg.bloque_acumulado, m["mape_4sem"].median(),
              int((m["mape_4sem"] <= 20).sum()), len(m))
+
+    cens = int(m["semanas_censuradas"].sum())
+    quiebre = m.loc[m["en_quiebre"], "kopr"].tolist()
+    log.info("  Semanas censuradas por quiebre en el backtest: %d", cens)
+    if quiebre:
+        log.warning("  SKUs sin stock al cierre, sin proyección: %s",
+                    ", ".join(quiebre))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -723,6 +803,12 @@ def main(argv: list[str] | None = None) -> int:
         log.info("Winsorización: %d semanas capadas (%.2f%%), %.0f unidades retiradas (%.2f%%)",
                  n, 100 * n / len(datos), retiradas,
                  100 * retiradas / max(datos["demanda_cruda"].sum(), 1))
+
+    datos = marcar_censuradas(datos, cfg)
+    n_cens = int(datos["censurada"].sum())
+    log.info("Semanas marcadas como censuradas por quiebre: %d de %d (%.2f%%), "
+             "umbral %.0f%% de la mediana previa",
+             n_cens, len(datos), 100 * n_cens / len(datos), 100 * cfg.umbral_censura)
 
     # --- 3. Modelo ---------------------------------------------------------
     resultados, fallidos = [], []
