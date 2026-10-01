@@ -98,6 +98,10 @@ class Config:
     ventana_censura: int = 13        # semanas previas para la mediana de referencia
     min_ventas_censura: float = 10.0  # si la mediana previa es menor, no se evalúa
 
+    # --- Stock ---------------------------------------------------------------
+    bodega: str = "B01"              # bodega de despacho de JNC
+    cobertura_aviso: float = 4.0     # semanas; bajo esto se avisa en el log
+
     # --- Operación ----------------------------------------------------------
     skus: tuple[str, ...] = SKUS_TESIS
     bloque_acumulado: int = 4        # tamaño del bloque para el MAPE acumulado
@@ -253,6 +257,27 @@ def leer_productos_mssql(conn, cfg: Config = CONFIG) -> pd.DataFrame:
     """
     df = pd.read_sql(query, conn)
     df["kopr"] = df["kopr"].astype(str).str.strip()
+    return df
+
+
+def leer_stock_mssql(conn, cfg: Config = CONFIG) -> pd.DataFrame:
+    """Unidades en bodega al momento de la corrida.
+
+    Se usa STFI1, el stock físico. STDV1 —el "disponible"— no se mantiene en
+    esta instalación: devuelve cero incluso para productos con más de catorce
+    mil unidades en bodega, así que cualquier cálculo de cobertura hecho sobre
+    ese campo daría quiebre inminente en todos los productos, siempre.
+    """
+    query = f"""
+    SELECT RTRIM(KOPR) AS kopr, RTRIM(KOBO) AS bodega, STFI1 AS stock_fisico
+    FROM dbo.MAEST WITH (NOLOCK)
+    WHERE RTRIM(KOBO) = '{cfg.bodega}'
+      AND RTRIM(KOPR) IN ({_lista_sql(cfg.skus)})
+    """
+    df = pd.read_sql(query, conn)
+    df["kopr"] = df["kopr"].astype(str).str.strip()
+    df["bodega"] = df["bodega"].astype(str).str.strip()
+    df["stock_fisico"] = df["stock_fisico"].astype(float).clip(lower=0)
     return df
 
 
@@ -650,6 +675,24 @@ def guardar_productos(conn, productos: pd.DataFrame, clusters: dict[str, str]) -
     conn.commit()
 
 
+def guardar_stock(conn, batch_id: int, stock: pd.DataFrame) -> None:
+    from psycopg2.extras import execute_values
+
+    if stock is None or stock.empty:
+        return
+    filas = [(batch_id, r.kopr, r.bodega, round(float(r.stock_fisico), 2))
+             for r in stock.itertuples()]
+    with conn.cursor() as cur:
+        execute_values(cur, """
+            INSERT INTO predictions.stock_snapshot
+                (batch_run_id, kopr, bodega, stock_fisico)
+            VALUES %s
+            ON CONFLICT (batch_run_id, kopr, bodega) DO UPDATE
+               SET stock_fisico = EXCLUDED.stock_fisico
+        """, filas)
+    conn.commit()
+
+
 def guardar_serie(conn, batch_id: int, filas: list[tuple]) -> None:
     from psycopg2.extras import execute_values
 
@@ -736,6 +779,37 @@ def resumen(resultados: list[dict], cfg: Config) -> None:
                     ", ".join(quiebre))
 
 
+def resumen_cobertura(resultados: list[dict], stock: pd.DataFrame,
+                      cfg: Config = CONFIG) -> None:
+    """Para cuántas semanas alcanza el stock de cada SKU.
+
+    Es el mismo cálculo que hace la vista v_cobertura_actual; acá solo se
+    reporta, para que la corrida avise de los productos en riesgo sin que
+    nadie tenga que consultar la base.
+    """
+    if stock is None or stock.empty or not resultados:
+        return
+
+    por_sku = {r["kopr"]: float(r["proyeccion"]["unidades"].mean())
+               for r in resultados if r["proyeccion"] is not None}
+    filas = []
+    for r in stock.itertuples():
+        d = por_sku.get(r.kopr)
+        if not d or d <= 0:
+            continue
+        filas.append((r.kopr, float(r.stock_fisico) / d))
+    if not filas:
+        return
+
+    filas.sort(key=lambda f: f[1])
+    mediana = float(np.median([f[1] for f in filas]))
+    log.info("Cobertura de stock: mediana %.1f semanas en %d SKUs", mediana, len(filas))
+    criticos = [f for f in filas if f[1] < cfg.cobertura_aviso]
+    if criticos:
+        log.warning("  Bajo %.0f semanas de cobertura: %s", cfg.cobertura_aviso,
+                    ", ".join(f"{k} ({c:.1f})" for k, c in criticos))
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Batch de pronóstico de demanda JNC")
     ap.add_argument("--dry-run", action="store_true",
@@ -762,10 +836,11 @@ def main(argv: list[str] | None = None) -> int:
 
     t0 = time.time()
     productos = pd.DataFrame(columns=["kopr", "nombre", "superfamilia"])
+    stock = pd.DataFrame(columns=["kopr", "bodega", "stock_fisico"])
 
-    # --- 1. Ventas ---------------------------------------------------------
+    # --- 1. Ventas y stock --------------------------------------------------
     if args.csv:
-        log.info("Leyendo ventas semanales de %s", args.csv)
+        log.info("Leyendo ventas semanales de %s (sin stock)", args.csv)
         semanal = leer_ventas_csv(args.csv)
         semanal = semanal[semanal["kopr"].isin(cfg.skus)]
     else:
@@ -774,8 +849,10 @@ def main(argv: list[str] | None = None) -> int:
         with conectar_mssql() as cx:
             diarias = leer_ventas_mssql(cx, cfg)
             productos = leer_productos_mssql(cx, cfg)
-        log.info("  %d filas diarias, %d productos en el maestro",
-                 len(diarias), len(productos))
+            stock = leer_stock_mssql(cx, cfg)
+        log.info("  %d filas diarias, %d productos en el maestro, "
+                 "stock de %d SKUs en bodega %s",
+                 len(diarias), len(productos), len(stock), cfg.bodega)
         semanal = semanalizar(diarias)
 
     datos = completar_grilla(semanal, cfg)
@@ -830,6 +907,7 @@ def main(argv: list[str] | None = None) -> int:
     log.info("Modelados %d SKUs, fallidos %d (%.1fs)",
              len(resultados), len(fallidos), time.time() - t0)
     resumen(resultados, cfg)
+    resumen_cobertura(resultados, stock, cfg)
 
     # --- 4. Persistencia ---------------------------------------------------
     if args.dry_run:
@@ -842,6 +920,7 @@ def main(argv: list[str] | None = None) -> int:
         clusters = {}  # el cluster ABC-XYZ se administra fuera del batch
         if len(productos):
             guardar_productos(conn, productos, clusters)
+        guardar_stock(conn, batch_id, stock)
         guardar_serie(conn, batch_id, armar_filas_serie(datos, resultados))
         guardar_metricas(conn, batch_id, [r["metricas"] | {"kopr": r["kopr"]}
                                           for r in resultados])
