@@ -472,53 +472,69 @@ def _ajustar(serie: np.ndarray, cfg: Config):
                    enforce_invertibility=False).fit(disp=False)
 
 
+def _n_dibujo(n_serie: int, cfg: Config) -> int:
+    """Semanas de backtest que se dibujan para una serie de largo `n_serie`."""
+    disponible = n_serie - cfg.semanas_entrenamiento
+    n = disponible if cfg.semanas_backtest is None else min(cfg.semanas_backtest, disponible)
+    n = max(n, cfg.semanas_evaluacion)   # nunca menos que la ventana de evaluación
+    return min(n, n_serie - 1)           # nunca toda la serie
+
+
+def _puntos_refit(n_serie: int, inicio: int, cfg: Config) -> list[int]:
+    """Posiciones donde se reestima el modelo, contadas hacia atrás desde el final.
+
+    Contar desde el final (y no desde el inicio) garantiza un reajuste justo al
+    comienzo de la ventana de evaluación y ninguno dentro de ella. Siempre
+    incluye `inicio`, que necesita un primer ajuste.
+    """
+    pts = {inicio}
+    p = n_serie - cfg.semanas_refit
+    while p > inicio:
+        pts.add(p)
+        p -= cfg.semanas_refit
+    return sorted(pts)
+
+
 def backtest_arima(serie: pd.Series,
                    cfg: Config = CONFIG) -> tuple[pd.Series, list[tuple[float, float]]]:
-    """Backtest sobre las últimas `semanas_backtest` semanas, en dos horizontes.
+    """Backtest con reajuste periódico sobre ventana móvil, en dos horizontes.
 
-    Se ajusta una vez sobre la ventana de entrenamiento y después se avanza
-    semana a semana incorporando el valor real observado, sin reestimar los
-    parámetros (`append(..., refit=False)`). Cada predicción usa solo
-    información anterior a la semana que estima.
+    La predicción a un paso se genera para toda la ventana de dibujo (ver
+    `_n_dibujo`). El modelo se reestima cada `semanas_refit` semanas sobre las
+    `semanas_entrenamiento` previas (solo datos anteriores); entre reajustes se
+    avanza con `append(..., refit=False)`. Cada predicción usa solo información
+    anterior a la semana que estima.
 
-    Devuelve dos cosas:
-
-    - la predicción **a un paso** de cada semana, que es la que se dibuja en
-      el gráfico como tramo de validación del modelo;
-    - los bloques de `bloque_acumulado` semanas, cada uno pronosticado de una
-      sola vez desde el inicio del bloque, sin conocer ninguna de sus semanas.
-      Este segundo horizonte es el que corresponde a lo que hace el producto
-      —proyectar cuatro semanas hacia adelante— y por lo tanto el que debe
-      sustentar la métrica que se muestra en la vista de cuatro semanas.
-      Sumar predicciones a un paso daría un error mucho menor y engañoso,
-      porque cada una conoce el resultado de la semana anterior.
+    Los bloques acumulados de `bloque_acumulado` semanas se calculan solo dentro
+    de la ventana de evaluación (las últimas `semanas_evaluacion`), alineados a
+    su inicio, cada uno pronosticado de una sola vez desde su comienzo, a ciegas.
+    Sumar predicciones a un paso daría un error mucho menor y engañoso.
     """
-    n_test = cfg.semanas_backtest
-    entrenamiento = serie.iloc[:-n_test]
-    prueba = serie.iloc[-n_test:]
+    N = len(serie)
+    n = _n_dibujo(N, cfg)
+    inicio = N - n
+    if inicio < cfg.min_semanas_sku:
+        return pd.Series(np.nan, index=serie.index[inicio:]), []
 
-    if len(entrenamiento) < cfg.min_semanas_sku:
-        return pd.Series(np.nan, index=prueba.index), []
-
-    ventana = entrenamiento.iloc[-cfg.semanas_entrenamiento:]
-    res = _ajustar(ventana.values.astype(float), cfg)
-
+    eval_ini = N - cfg.semanas_evaluacion
+    refits = set(_puntos_refit(N, inicio, cfg))
     B = cfg.bloque_acumulado
-    valores = prueba.values.astype(float)
+    valores = serie.values.astype(float)
+
     pred_1paso: list[float] = []
     bloques: list[tuple[float, float]] = []
-
-    for i in range(0, n_test, B):
-        tramo = valores[i:i + B]
-        if len(tramo) == B:
+    res = None
+    for i in range(inicio, N):
+        if i in refits:
+            res = _ajustar(valores[max(0, i - cfg.semanas_entrenamiento):i], cfg)
+        if i >= eval_ini and (i - eval_ini) % B == 0 and i + B <= N:
             # Pronóstico de todo el bloque desde su inicio, a ciegas.
             f = np.clip(np.asarray(res.forecast(B), dtype=float), 0, None)
-            bloques.append((float(tramo.sum()), float(f.sum())))
-        for real in tramo:
-            pred_1paso.append(float(np.clip(res.forecast(1)[0], 0, None)))
-            res = res.append([real], refit=False)
+            bloques.append((float(valores[i:i + B].sum()), float(f.sum())))
+        pred_1paso.append(float(np.clip(res.forecast(1)[0], 0, None)))
+        res = res.append([valores[i]], refit=False)
 
-    return pd.Series(pred_1paso, index=prueba.index), bloques
+    return pd.Series(pred_1paso, index=serie.index[inicio:]), bloques
 
 
 def proyectar_arima(serie: pd.Series, cfg: Config = CONFIG) -> pd.DataFrame:
