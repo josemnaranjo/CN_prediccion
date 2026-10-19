@@ -119,6 +119,8 @@ class Config:
             raise ValueError(
                 f"semanas_backtest ({self.semanas_backtest}) debe ser >= "
                 f"semanas_evaluacion ({self.semanas_evaluacion})")
+        if self.semanas_refit <= 0:
+            raise ValueError(f"semanas_refit ({self.semanas_refit}) debe ser > 0")
         p, d, q = self.orden_arima
         self.nombre_modelo = f"ARIMA({p},{d},{q})"
 
@@ -526,7 +528,20 @@ def backtest_arima(serie: pd.Series,
     res = None
     for i in range(inicio, N):
         if i in refits:
-            res = _ajustar(valores[max(0, i - cfg.semanas_entrenamiento):i], cfg)
+            ventana = valores[max(0, i - cfg.semanas_entrenamiento):i]
+            if i < eval_ini:
+                # Solo alimenta la línea dibujada: un fallo no debe perder el SKU.
+                try:
+                    res = _ajustar(ventana, cfg)
+                except Exception as e:
+                    log.warning("backtest: falló el reajuste en i=%d (%s); "
+                                "predicciones NaN hasta el próximo reajuste", i, e)
+                    res = None
+            else:
+                res = _ajustar(ventana, cfg)   # ventana de evaluación: sin protección
+        if res is None:
+            pred_1paso.append(float("nan"))
+            continue
         if i >= eval_ini and (i - eval_ini) % B == 0 and i + B <= N:
             # Pronóstico de todo el bloque desde su inicio, a ciegas.
             f = np.clip(np.asarray(res.forecast(B), dtype=float), 0, None)

@@ -143,3 +143,57 @@ def test_resumen_loguea_ventanas_separadas(caplog):
         b.resumen([r], Config())
     assert "12 semanas evaluadas" in caplog.text
     assert "de 79 a 79 semanas" in caplog.text
+
+
+def _ajustar_que_falla_en(monkeypatch, llamadas_fallidas):
+    original = b._ajustar
+    contador = {"n": 0}
+
+    def falso(serie, cfg):
+        contador["n"] += 1
+        if contador["n"] in llamadas_fallidas:
+            raise np.linalg.LinAlgError("ventana degenerada")
+        return original(serie, cfg)
+    monkeypatch.setattr(b, "_ajustar", falso)
+
+
+def test_refit_dibujo_que_falla_da_nan_y_no_rompe(monkeypatch):
+    s, c = serie_sintetica(), Config()
+    ref_pred, ref_bloques = backtest_legacy(s, c)
+    _ajustar_que_falla_en(monkeypatch, {2})       # refit en i=85 (< eval_ini)
+    pred, bloques = b.backtest_arima(s, c)
+    inicio = len(s) - b._n_dibujo(len(s), c)
+    assert pred.iloc[85 - inicio:97 - inicio].isna().all()
+    assert pred.iloc[:85 - inicio].notna().all()
+    assert pred.iloc[97 - inicio:].notna().all()
+    np.testing.assert_allclose(pred.iloc[-12:].values, ref_pred.values)
+    assert bloques == pytest.approx(ref_bloques)
+
+
+def test_primer_ajuste_que_falla_da_nan_hasta_el_siguiente(monkeypatch):
+    s, c = serie_sintetica(), Config()
+    ref_pred, _ = backtest_legacy(s, c)
+    _ajustar_que_falla_en(monkeypatch, {1})
+    pred, _ = b.backtest_arima(s, c)
+    inicio = len(s) - b._n_dibujo(len(s), c)
+    assert pred.iloc[:85 - inicio].isna().all()
+    assert pred.iloc[85 - inicio:].notna().all()
+    np.testing.assert_allclose(pred.iloc[-12:].values, ref_pred.values)
+
+
+def test_refit_de_evaluacion_sigue_sin_proteccion(monkeypatch):
+    s, c = serie_sintetica(), Config()
+    n_refits = len(b._puntos_refit(len(s), len(s) - b._n_dibujo(len(s), c), c))
+    _ajustar_que_falla_en(monkeypatch, {n_refits})  # el de eval_ini
+    with pytest.raises(np.linalg.LinAlgError):
+        b.backtest_arima(s, c)
+
+
+@pytest.mark.parametrize("v", [0, -1])
+def test_config_semanas_refit_no_positivo_falla(v):
+    with pytest.raises(ValueError):
+        Config(semanas_refit=v)
+
+
+def test_config_semanas_refit_distinto_de_evaluacion_ok():
+    assert Config(semanas_refit=6).semanas_refit == 6
