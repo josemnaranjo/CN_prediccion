@@ -71,9 +71,14 @@ TIPOS_NEGATIVOS: frozenset[str] = frozenset({"NCV"})
 class Config:
     # --- Ventana de datos ---------------------------------------------------
     meses_historia: int = 42        # se leen 42 meses y se usan los que hagan falta
-    semanas_entrenamiento: int = 78  # 18 meses, igual que en el estudio
-    semanas_backtest: int = 12       # tramo de evaluación, igual que el set de prueba
-    min_semanas_sku: int = 30        # mínimo para intentar modelar un SKU
+    semanas_entrenamiento: int = 78   # 18 meses, igual que en el estudio
+    semanas_evaluacion: int = 12      # ventana de las métricas. NO cambiar: define
+                                      # las cifras reportadas en la tesis
+    semanas_backtest: int | None = None  # ventana dibujada; None = todo lo posible
+    semanas_refit: int = 12           # cada cuántas semanas se reestima el modelo;
+                                      # debe ser igual a semanas_evaluacion para que
+                                      # las métricas sigan comparables con el estudio
+    min_semanas_sku: int = 30         # mínimo para intentar modelar un SKU
 
     # --- Modelo -------------------------------------------------------------
     orden_arima: tuple[int, int, int] = (1, 1, 1)
@@ -109,6 +114,11 @@ class Config:
     nombre_modelo: str = field(init=False)
 
     def __post_init__(self) -> None:
+        if (self.semanas_backtest is not None
+                and self.semanas_backtest < self.semanas_evaluacion):
+            raise ValueError(
+                f"semanas_backtest ({self.semanas_backtest}) debe ser >= "
+                f"semanas_evaluacion ({self.semanas_evaluacion})")
         p, d, q = self.orden_arima
         self.nombre_modelo = f"ARIMA({p},{d},{q})"
 
