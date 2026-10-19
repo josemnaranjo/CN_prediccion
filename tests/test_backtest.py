@@ -103,3 +103,35 @@ def test_cantidad_de_ajustes(monkeypatch):
     monkeypatch.setattr(b, "_ajustar", lambda *a, **k: (llamadas.append(1), orig(*a, **k))[1])
     b.backtest_arima(serie_sintetica(), Config())
     assert len(llamadas) <= 8                 # ~79/12 ≈ 7, nunca uno por semana
+
+
+def df_sku(n=157, censurar_antes=0):
+    s = serie_sintetica(n)
+    cens = np.zeros(n, bool)
+    if censurar_antes:
+        cens[10:10 + censurar_antes] = True       # lejos de la evaluación
+    return pd.DataFrame({"semana": list(s.index), "demanda": s.values, "censurada": cens})
+
+
+def test_metricas_solo_sobre_evaluacion():
+    r = b.procesar_sku("X", df_sku(), Config())
+    assert len(r["backtest"]) == 79
+    m = r["metricas"]
+    assert m["semanas_backtest"] == 12
+    assert m["semanas_dibujo"] == 79
+    assert m["bloques_4sem"] == 3
+    ref_pred, _ = backtest_legacy(serie_sintetica(), Config())
+    reales = serie_sintetica().loc[ref_pred.index]
+    assert m["mape_semanal"] == pytest.approx(b.mape(reales.values, ref_pred.values))
+
+
+def test_censura_antigua_no_afecta_metricas_ni_quiebre():
+    base = b.procesar_sku("X", df_sku(), Config())["metricas"]
+    con = b.procesar_sku("X", df_sku(censurar_antes=5), Config())["metricas"]
+    assert con["mape_semanal"] == base["mape_semanal"]
+    assert con["semanas_censuradas"] == 0 and con["en_quiebre"] is False
+
+
+def test_guard_de_largo_minimo():
+    assert b.procesar_sku("X", df_sku(n=41), Config()) is None
+    assert b.procesar_sku("X", df_sku(n=42), Config()) is not None

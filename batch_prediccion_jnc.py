@@ -598,7 +598,7 @@ def procesar_sku(kopr: str, g: pd.DataFrame, cfg: Config = CONFIG) -> dict | Non
     g = g.sort_values("semana")
     serie = pd.Series(g["demanda"].values, index=list(g["semana"]), dtype=float)
 
-    minimo = cfg.min_semanas_sku + cfg.semanas_backtest
+    minimo = cfg.min_semanas_sku + cfg.semanas_evaluacion
     if len(serie) < minimo:
         log.warning("%s: %d semanas, se requieren %d. Se omite.",
                     kopr, len(serie), minimo)
@@ -608,32 +608,38 @@ def procesar_sku(kopr: str, g: pd.DataFrame, cfg: Config = CONFIG) -> dict | Non
                  if "censurada" in g else pd.Series(False, index=serie.index))
 
     pred_backtest, bloques_pron = backtest_arima(serie, cfg)
-    reales = serie.loc[pred_backtest.index]
-    cens_test = censurada.loc[pred_backtest.index].to_numpy(bool)
+
+    # Las métricas salen solo de la ventana de evaluación; el resto del
+    # backtest es únicamente para dibujar la línea del modelo.
+    eval_idx = pred_backtest.index[-cfg.semanas_evaluacion:]
+    reales_eval = serie.loc[eval_idx]
+    pred_eval = pred_backtest.loc[eval_idx]
+    cens_eval = censurada.loc[eval_idx].to_numpy(bool)
 
     # Un bloque acumulado se descarta completo si alguna de sus semanas está
     # censurada: su suma tampoco representa la demanda del período.
     B = cfg.bloque_acumulado
     bloques_limpios = [b for i, b in enumerate(bloques_pron)
-                       if not cens_test[i * B:(i + 1) * B].any()]
+                       if not cens_eval[i * B:(i + 1) * B].any()]
 
-    m_sem = mape(reales.values, pred_backtest.values, excluir=cens_test)
+    m_sem = mape(reales_eval.values, pred_eval.values, excluir=cens_eval)
     m_acum, bloques = mape_bloques(bloques_limpios)
-    mae = float(np.abs(reales.values - pred_backtest.values).mean())
+    mae = float(np.abs(reales_eval.values - pred_eval.values).mean())
 
     # Sin stock en la última semana cerrada. La proyección se genera igual
     # —estima demanda, que existe aunque no haya producto— pero el dashboard
     # debe advertirlo: esa demanda no se va a concretar si no se repone.
-    en_quiebre = bool(cens_test[-1]) if len(cens_test) else False
+    en_quiebre = bool(cens_eval[-1]) if len(cens_eval) else False
 
     return {
         "kopr": kopr,
         "backtest": pred_backtest,
         "proyeccion": proyectar_arima(serie, cfg),
         "metricas": {
-            "semanas_backtest": int(len(pred_backtest)),
-            "semanas_para_mape": int(((reales.values != 0) & ~cens_test).sum()),
-            "semanas_censuradas": int(cens_test.sum()),
+            "semanas_backtest": int(len(pred_eval)),   # semanas de las métricas
+            "semanas_dibujo": int(len(pred_backtest)), # solo log; no se persiste
+            "semanas_para_mape": int(((reales_eval.values != 0) & ~cens_eval).sum()),
+            "semanas_censuradas": int(cens_eval.sum()),
             "mape_semanal": m_sem,
             "mae_semanal": mae,
             "mape_4sem": m_acum,
