@@ -796,7 +796,8 @@ def resumen(resultados: list[dict], cfg: Config) -> None:
     m = pd.DataFrame([r["metricas"] | {"kopr": r["kopr"]} for r in resultados])
     # Se reporta la mediana y no la media: con MAPE, un solo SKU de demanda
     # baja distorsiona el promedio en un orden de magnitud.
-    log.info("Resumen del backtest (%d semanas por SKU):", cfg.semanas_backtest)
+    log.info("Resumen del backtest (%d semanas evaluadas por SKU; línea dibujada de %d a %d semanas):",
+             cfg.semanas_evaluacion, int(m["semanas_dibujo"].min()), int(m["semanas_dibujo"].max()))
     log.info("  MAPE semanal    — mediana %.2f%% | SKUs sobre 100%%: %d de %d",
              m["mape_semanal"].median(), int((m["mape_semanal"] > 100).sum()), len(m))
     log.info("  MAPE %d semanas  — mediana %.2f%% | SKUs <= 20%%: %d de %d",

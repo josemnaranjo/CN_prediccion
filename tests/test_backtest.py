@@ -135,3 +135,11 @@ def test_censura_antigua_no_afecta_metricas_ni_quiebre():
 def test_guard_de_largo_minimo():
     assert b.procesar_sku("X", df_sku(n=41), Config()) is None
     assert b.procesar_sku("X", df_sku(n=42), Config()) is not None
+
+
+def test_resumen_loguea_ventanas_separadas(caplog):
+    r = b.procesar_sku("X", df_sku(), Config())
+    with caplog.at_level("INFO"):
+        b.resumen([r], Config())
+    assert "12 semanas evaluadas" in caplog.text
+    assert "de 79 a 79 semanas" in caplog.text
