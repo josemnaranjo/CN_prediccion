@@ -226,3 +226,31 @@ def test_resumen_cobertura_sin_factor_igual_a_hoy(caplog):
     stock = pd.DataFrame({"kopr": ["5131018"], "bodega": ["B01"], "stock_fisico": [3355.0]})
     b.resumen_cobertura([_resultado("5131018", 564.0)], stock, Config())
     assert "mediana 5.9 semanas" in caplog.text   # 3355 / 564 = 5.95 -> %.1f da 5.9
+
+
+SQL_006 = Path(__file__).resolve().parent.parent / "sql" / "006_factor_bonificacion.sql"
+COLUMNAS_004 = ["kopr", "nombre", "cluster_abcxyz", "semana_corte", "bodega", "stock_fisico",
+                "demanda_semanal", "demanda_inf", "demanda_sup", "cobertura_semanas",
+                "cobertura_min", "cobertura_max", "en_quiebre", "mape_semanal", "mape_4sem",
+                "batch_run_id"]
+
+
+def test_migracion_006_forma():
+    sql = SQL_006.read_text()
+    assert "ADD COLUMN IF NOT EXISTS factor_bonificacion NUMERIC(6,4)" in sql
+    assert "DROP VIEW IF EXISTS predictions.v_cobertura_actual" in sql
+    assert "CREATE VIEW predictions.v_cobertura_actual" in sql
+    assert "CREATE OR REPLACE VIEW" not in sql
+    assert sql.count("COALESCE(m.factor_bonificacion, 0)") >= 3
+    assert sql.strip().upper().rstrip(";").endswith("COMMIT")
+
+
+def test_migracion_006_conserva_columnas_de_004_y_agrega_al_final():
+    import re
+    sql = SQL_006.read_text()
+    cuerpo = sql.split("CREATE VIEW predictions.v_cobertura_actual", 1)[1]
+    seleccion = cuerpo.split("FROM corrida AS c", 1)[0].rsplit("SELECT", 1)[-1]
+    nombres = re.findall(r"(?:AS\s+(\w+)|\b\w+\.(\w+))\s*,?\s*(?:\n|$)", seleccion)
+    nombres = [a or b for a, b in nombres]
+    assert nombres[:len(COLUMNAS_004)] == COLUMNAS_004
+    assert nombres[len(COLUMNAS_004):] == ["factor_bonificacion", "salida_semanal"]
