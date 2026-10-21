@@ -173,3 +173,56 @@ def test_semanalizar_bonificado_agrupa_por_lunes():
 def test_semanalizar_bonificado_vacio():
     r = b.semanalizar_bonificado(pd.DataFrame(columns=["kopr", "fecha", "bonificado"]))
     assert list(r.columns) == ["kopr", "semana", "bonificado"] and r.empty
+
+
+class _FakeCursor:
+    def __init__(self, store): self.store = store
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def execute(self, *a, **k): self.store["executed"] = a
+
+
+class _FakeConn:
+    def __init__(self): self.store = {}
+    def cursor(self): return _FakeCursor(self.store)
+    def commit(self): self.store["commit"] = True
+
+
+def _metrica(kopr, **extra):
+    base = {"kopr": kopr, "semanas_backtest": 12, "semanas_para_mape": 12,
+            "semanas_censuradas": 0, "mape_semanal": 20.0, "mae_semanal": 5.0,
+            "mape_4sem": 15.0, "bloques_4sem": 3, "en_quiebre": False}
+    return base | extra
+
+
+def test_guardar_metricas_persiste_el_factor(monkeypatch):
+    capturado = {}
+    import psycopg2.extras
+    monkeypatch.setattr(psycopg2.extras, "execute_values",
+                        lambda cur, sql, filas, **k: capturado.update(sql=sql, filas=filas))
+    conn = _FakeConn()
+    b.guardar_metricas(conn, 7, [_metrica("A", factor_bonificacion=0.26123456),
+                                 _metrica("B", factor_bonificacion=None),
+                                 _metrica("C")])          # sin la clave: NULL
+    assert "factor_bonificacion" in capturado["sql"]
+    assert [f[-1] for f in capturado["filas"]] == [0.2612, None, None]
+    assert conn.store["commit"] is True
+
+
+def _resultado(kopr, demanda):
+    return {"kopr": kopr, "proyeccion": pd.DataFrame({"unidades": [demanda] * 4})}
+
+
+def test_resumen_cobertura_con_factor(caplog):
+    caplog.set_level(logging.INFO)
+    stock = pd.DataFrame({"kopr": ["5131018"], "bodega": ["B01"], "stock_fisico": [3355.0]})
+    b.resumen_cobertura([_resultado("5131018", 564.0)], stock, Config(),
+                        factores={"5131018": {"factor": 0.261, "factor_largo": 0.26}})
+    assert "mediana 4.7 semanas" in caplog.text
+
+
+def test_resumen_cobertura_sin_factor_igual_a_hoy(caplog):
+    caplog.set_level(logging.INFO)
+    stock = pd.DataFrame({"kopr": ["5131018"], "bodega": ["B01"], "stock_fisico": [3355.0]})
+    b.resumen_cobertura([_resultado("5131018", 564.0)], stock, Config())
+    assert "mediana 5.9 semanas" in caplog.text   # 3355 / 564 = 5.95 -> %.1f da 5.9

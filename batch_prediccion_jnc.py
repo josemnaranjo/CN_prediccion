@@ -901,16 +901,21 @@ def guardar_metricas(conn, batch_id: int, metricas: list[dict]) -> None:
 
     if not metricas:
         return
+
+    def _factor(m):
+        f = _nulo(m.get("factor_bonificacion"))
+        return None if f is None else round(float(f), 4)
+
     filas = [(batch_id, m["kopr"], m["semanas_backtest"], m["semanas_para_mape"],
               m["semanas_censuradas"], _nulo(m["mape_semanal"]),
               _nulo(m["mae_semanal"]), _nulo(m["mape_4sem"]),
-              m["bloques_4sem"], m["en_quiebre"]) for m in metricas]
+              m["bloques_4sem"], m["en_quiebre"], _factor(m)) for m in metricas]
     with conn.cursor() as cur:
         execute_values(cur, """
             INSERT INTO predictions.metrica_sku
                 (batch_run_id, kopr, semanas_backtest, semanas_para_mape,
                  semanas_censuradas, mape_semanal, mae_semanal, mape_4sem,
-                 bloques_4sem, en_quiebre)
+                 bloques_4sem, en_quiebre, factor_bonificacion)
             VALUES %s
         """, filas)
     conn.commit()
@@ -968,8 +973,9 @@ def resumen(resultados: list[dict], cfg: Config) -> None:
 
 
 def resumen_cobertura(resultados: list[dict], stock: pd.DataFrame,
-                      cfg: Config = CONFIG) -> None:
-    """Para cuántas semanas alcanza el stock de cada SKU.
+                      cfg: Config = CONFIG, factores: dict | None = None) -> None:
+    """Para cuántas semanas alcanza el stock de cada SKU, incluyendo la salida
+    por bonificado cuando hay factor.
 
     Es el mismo cálculo que hace la vista v_cobertura_actual; acá solo se
     reporta, para que la corrida avise de los productos en riesgo sin que
@@ -985,7 +991,8 @@ def resumen_cobertura(resultados: list[dict], stock: pd.DataFrame,
         d = por_sku.get(r.kopr)
         if not d or d <= 0:
             continue
-        filas.append((r.kopr, float(r.stock_fisico) / d))
+        f = ((factores or {}).get(r.kopr) or {}).get("factor") or 0.0
+        filas.append((r.kopr, float(r.stock_fisico) / (d * (1 + f))))
     if not filas:
         return
 
@@ -1031,17 +1038,21 @@ def main(argv: list[str] | None = None) -> int:
         log.info("Leyendo ventas semanales de %s (sin stock)", args.csv)
         semanal = leer_ventas_csv(args.csv)
         semanal = semanal[semanal["kopr"].isin(cfg.skus)]
+        bonif_sem = None
+        log.info("Sin datos de bonificado en el modo --desde-csv: el factor queda NULL")
     else:
         log.info("Leyendo ventas de Softland (%d meses, %d SKUs)",
                  cfg.meses_historia, len(cfg.skus))
         with conectar_mssql() as cx:
-            diarias = leer_ventas_mssql(cx, cfg)
+            diarias, bonificado = leer_ventas_mssql(cx, cfg)
             productos = leer_productos_mssql(cx, cfg)
             stock = leer_stock_mssql(cx, cfg)
         log.info("  %d filas diarias, %d productos en el maestro, "
-                 "stock de %d SKUs en bodega %s",
-                 len(diarias), len(productos), len(stock), cfg.bodega)
+                 "stock de %d SKUs en bodega %s, %d filas de bonificado",
+                 len(diarias), len(productos), len(stock), cfg.bodega,
+                 len(bonificado))
         semanal = semanalizar(diarias)
+        bonif_sem = semanalizar_bonificado(bonificado)
 
     datos = completar_grilla(semanal, cfg)
     if datos.empty:
@@ -1056,6 +1067,9 @@ def main(argv: list[str] | None = None) -> int:
     faltantes = sorted(set(cfg.skus) - set(datos["kopr"]))
     if faltantes:
         log.warning("Sin ventas en el período: %s", ", ".join(faltantes))
+
+    factores = calcular_factores_bonificacion(semanal, bonif_sem, ultima_semana_cerrada(), cfg)
+    advertir_factores(factores, cfg)
 
     # --- 2. Tratamiento ----------------------------------------------------
     if args.sin_tratamiento:
@@ -1094,8 +1108,10 @@ def main(argv: list[str] | None = None) -> int:
 
     log.info("Modelados %d SKUs, fallidos %d (%.1fs)",
              len(resultados), len(fallidos), time.time() - t0)
+    for r in resultados:
+        r["metricas"]["factor_bonificacion"] = (factores.get(r["kopr"]) or {}).get("factor")
     resumen(resultados, cfg)
-    resumen_cobertura(resultados, stock, cfg)
+    resumen_cobertura(resultados, stock, cfg, factores)
 
     # --- 4. Persistencia ---------------------------------------------------
     if args.dry_run:
