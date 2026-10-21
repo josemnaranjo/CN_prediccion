@@ -111,6 +111,17 @@ class Config:
     skus: tuple[str, ...] = SKUS_TESIS
     bloque_acumulado: int = 4        # tamaño del bloque para el MAPE acumulado
 
+    # --- Bonificación (GDI) -------------------------------------------------
+    # Mercadería bonificada ("compras 4, te regalo 1"): sale de la bodega pero no
+    # aparece en ninguna factura. El factor es un dato paralelo a la demanda: no
+    # entra al entrenamiento ni a las métricas.
+    semanas_factor_bonif: int = 13   # ventana del factor, en semanas cerradas
+    semanas_factor_largo: int = 52   # solo para advertir deriva de la mecánica comercial
+    tido_bonificacion: tuple[str, ...] = ("GDI",)
+    skus_sin_factor: tuple[str, ...] = ("5131012",)  # unidad de bonificado ≠ unidad de venta
+    factor_bonif_maximo: float = 0.60    # sobre esto, solo advierte
+    umbral_deriva_factor: float = 0.10   # |factor13 - factor52| sobre esto, advierte
+
     nombre_modelo: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -121,6 +132,10 @@ class Config:
                 f"semanas_evaluacion ({self.semanas_evaluacion})")
         if self.semanas_refit <= 0:
             raise ValueError(f"semanas_refit ({self.semanas_refit}) debe ser > 0")
+        if set(self.tido_bonificacion) & set(TIPOS_VENTA):
+            raise ValueError(
+                f"tido_bonificacion {self.tido_bonificacion} no puede incluir "
+                f"tipos de venta {TIPOS_VENTA}: se contaría doble")
         p, d, q = self.orden_arima
         self.nombre_modelo = f"ARIMA({p},{d},{q})"
 
@@ -319,6 +334,11 @@ def leer_ventas_csv(ruta: str) -> pd.DataFrame:
     return d[["kopr", "semana", "demanda"]]
 
 
+def ultima_semana_cerrada(hoy: date | None = None) -> date:
+    """Lunes de la última semana ISO completa (la semana en curso no cuenta)."""
+    return lunes_de(hoy or date.today()) - timedelta(weeks=1)
+
+
 def completar_grilla(semanal: pd.DataFrame, cfg: Config = CONFIG) -> pd.DataFrame:
     """Rellena con cero las semanas sin movimiento y recorta la última semana.
 
@@ -329,7 +349,7 @@ def completar_grilla(semanal: pd.DataFrame, cfg: Config = CONFIG) -> pd.DataFram
     if semanal.empty:
         return semanal
 
-    ultima_cerrada = lunes_de(date.today()) - timedelta(weeks=1)
+    ultima_cerrada = ultima_semana_cerrada()
     semanal = semanal[semanal["semana"] <= ultima_cerrada]
 
     inicio, fin = semanal["semana"].min(), semanal["semana"].max()
@@ -345,6 +365,90 @@ def completar_grilla(semanal: pd.DataFrame, cfg: Config = CONFIG) -> pd.DataFram
     # dataset de entrenamiento.
     d["demanda"] = d["demanda"].clip(lower=0.0)
     return d.sort_values(["kopr", "semana"]).reset_index(drop=True)
+
+
+# ============================================================================
+# Factor de bonificación
+# ============================================================================
+
+FACTOR_MAX_ALMACENABLE = 99.9999  # límite de NUMERIC(6,4)
+
+
+def _suma_ventana(df: pd.DataFrame | None, col: str, hasta: date, semanas: int) -> dict:
+    if df is None or df.empty:
+        return {}
+    desde = hasta - timedelta(weeks=semanas - 1)
+    d = df[(df["semana"] >= desde) & (df["semana"] <= hasta)]
+    return d.groupby("kopr")[col].sum().to_dict()
+
+
+def _razon_bonificacion(kopr: str, bonif: float, venta: float, semanas: int) -> float | None:
+    if venta <= 0:
+        return None
+    f = bonif / venta
+    if not 0 <= f < FACTOR_MAX_ALMACENABLE:
+        log.warning("  %s: factor de bonificación %.4f fuera de rango en %d semanas "
+                    "(bonificado %.0f, venta neta %.0f). Se deja sin factor.",
+                    kopr, f, semanas, bonif, venta)
+        return None
+    return float(f)
+
+
+def calcular_factores_bonificacion(ventas: pd.DataFrame, bonificado: pd.DataFrame | None,
+                                   ultima_cerrada: date,
+                                   cfg: Config = CONFIG) -> dict[str, dict[str, float | None]]:
+    """Bonificado sobre venta neta, agregado por SKU en la ventana y luego dividido.
+
+    No es el promedio de los factores semanales: semana a semana el factor es
+    errático porque la entrega del bonificado no cae en la semana de la factura.
+    Al agregar ese ruido de calendario desaparece, y como la tarjeta proyecta
+    cuatro semanas, el agregado es la escala que corresponde.
+
+    `ventas` es la venta neta semanal cruda (sin winsorizar). Con
+    `bonificado=None` (no hay fuente, p. ej. --desde-csv) devuelve {}.
+    """
+    if bonificado is None:
+        return {}
+
+    resultado: dict[str, dict[str, float | None]] = {}
+    ventanas = {"factor": cfg.semanas_factor_bonif, "factor_largo": cfg.semanas_factor_largo}
+    sumas = {clave: (_suma_ventana(ventas, "demanda", ultima_cerrada, n),
+                     _suma_ventana(bonificado, "bonificado", ultima_cerrada, n))
+             for clave, n in ventanas.items()}
+
+    for kopr in cfg.skus:
+        if kopr in cfg.skus_sin_factor:
+            resultado[kopr] = {"factor": None, "factor_largo": None}
+            continue
+        resultado[kopr] = {
+            clave: _razon_bonificacion(kopr, bon.get(kopr, 0.0), ven.get(kopr, 0.0), n)
+            for clave, n in ventanas.items()
+            for ven, bon in [sumas[clave]]
+        }
+    return resultado
+
+
+def advertir_factores(factores: dict, cfg: Config = CONFIG) -> None:
+    """Avisa de factores atípicos: reflejan decisiones comerciales que cambian sin aviso."""
+    if not factores:
+        return
+    con_factor = sum(1 for v in factores.values() if v["factor"] is not None)
+    log.info("Factor de bonificación (%d semanas): %d de %d SKUs con factor",
+             cfg.semanas_factor_bonif, con_factor, len(factores))
+    for kopr, v in sorted(factores.items()):
+        f, largo = v["factor"], v["factor_largo"]
+        if f is None:
+            continue
+        if f > cfg.factor_bonif_maximo:
+            log.warning("  %s: factor de bonificación %.1f%% sobre el máximo de %.0f%%. "
+                        "Se usa igual; verificar que no sea un error de datos.",
+                        kopr, 100 * f, 100 * cfg.factor_bonif_maximo)
+        if largo is not None and abs(f - largo) > cfg.umbral_deriva_factor:
+            log.warning("  %s: el factor de %d semanas (%.1f%%) difiere del de %d semanas "
+                        "(%.1f%%) en más de %.0f puntos: la mecánica comercial cambió.",
+                        kopr, cfg.semanas_factor_bonif, 100 * f,
+                        cfg.semanas_factor_largo, 100 * largo,
+                        100 * cfg.umbral_deriva_factor)
 
 
 # ============================================================================
