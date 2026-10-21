@@ -245,33 +245,60 @@ def _lista_sql(valores) -> str:
     return ",".join(f"'{v}'" for v in valores)
 
 
-def leer_ventas_mssql(conn, cfg: Config = CONFIG) -> pd.DataFrame:
-    """Ventas diarias por SKU desde Softland.
-
-    Esta consulta es la que quedó validada en la reconciliación del 29-09-2026
-    contra el dataset de entrenamiento. Cualquier cambio en los tipos de
-    documento, en la columna de cantidad o en la clave de producto rompe la
-    equivalencia con los datos sobre los que se midió el error del modelo.
-    """
-    query = f"""
+def _query_ventas(cfg: Config) -> str:
+    venta = _lista_sql(TIPOS_VENTA)
+    negativos = _lista_sql(TIPOS_NEGATIVOS)
+    bonif = _lista_sql(cfg.tido_bonificacion)
+    return f"""
     SELECT
       RTRIM(DDO.KOPRCT) AS kopr,
       CONVERT(DATE, EDO.FEEMDO) AS fecha,
-      SUM(DDO.CAPRCO1 * CASE WHEN EDO.TIDO IN ({_lista_sql(TIPOS_NEGATIVOS)})
-                             THEN -1 ELSE 1 END) AS unidades
+      SUM(CASE WHEN EDO.TIDO IN ({venta})
+               THEN DDO.CAPRCO1 * CASE WHEN EDO.TIDO IN ({negativos}) THEN -1 ELSE 1 END
+               ELSE 0 END) AS unidades,
+      SUM(CASE WHEN EDO.TIDO IN ({bonif}) THEN DDO.CAPRCO1 ELSE 0 END) AS bonificado,
+      SUM(CASE WHEN EDO.TIDO IN ({venta}) THEN 1 ELSE 0 END) AS lineas_venta
     FROM dbo.MAEEDO AS EDO WITH (NOLOCK)
     INNER JOIN dbo.MAEDDO AS DDO WITH (NOLOCK) ON EDO.IDMAEEDO = DDO.IDMAEEDO
-    WHERE EDO.TIDO IN ({_lista_sql(TIPOS_VENTA)})
+    WHERE EDO.TIDO IN ({_lista_sql(TIPOS_VENTA + tuple(cfg.tido_bonificacion))})
       AND EDO.FEEMDO >= DATEADD(MONTH, -{cfg.meses_historia}, GETDATE())
       AND EDO.FEEMDO <  DATEADD(DAY, 1, GETDATE())
       AND RTRIM(DDO.KOPRCT) IN ({_lista_sql(cfg.skus)})
     GROUP BY RTRIM(DDO.KOPRCT), CONVERT(DATE, EDO.FEEMDO)
     """
-    df = pd.read_sql(query, conn)
+
+
+def separar_ventas_y_bonificado(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Parte el resultado de `_query_ventas` en la venta y el bonificado.
+
+    La venta conserva solo los días con al menos una línea de venta, que son
+    exactamente las filas que devolvía la consulta antes de agregar GDI. Un
+    día con solo guías de bonificado no debe aparecer ahí: ampliaría la grilla
+    de semanas y movería la historia sobre la que se midió el modelo.
+    """
+    ventas = (df.loc[df["lineas_venta"] > 0, ["kopr", "fecha", "unidades"]]
+                .reset_index(drop=True))
+    bonificado = (df.loc[df["bonificado"] != 0, ["kopr", "fecha", "bonificado"]]
+                    .reset_index(drop=True))
+    return ventas, bonificado
+
+
+def leer_ventas_mssql(conn, cfg: Config = CONFIG) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Ventas diarias por SKU y bonificado diario, desde Softland, en una sola pasada.
+
+    La parte de venta es la consulta validada en la reconciliación del
+    29-09-2026 contra el dataset de entrenamiento. Cualquier cambio en los tipos
+    de documento, en la columna de cantidad o en la clave de producto rompe la
+    equivalencia con los datos sobre los que se midió el error del modelo; por
+    eso el bonificado solo se *agrega* como segundo agregado y la venta que se
+    devuelve es la misma de antes.
+    """
+    df = pd.read_sql(_query_ventas(cfg), conn)
     df["kopr"] = df["kopr"].astype(str).str.strip()
     df["fecha"] = pd.to_datetime(df["fecha"])
     df["unidades"] = df["unidades"].astype(float)
-    return df
+    df["bonificado"] = df["bonificado"].astype(float)
+    return separar_ventas_y_bonificado(df)
 
 
 def leer_productos_mssql(conn, cfg: Config = CONFIG) -> pd.DataFrame:
@@ -306,6 +333,15 @@ def leer_stock_mssql(conn, cfg: Config = CONFIG) -> pd.DataFrame:
     df["bodega"] = df["bodega"].astype(str).str.strip()
     df["stock_fisico"] = df["stock_fisico"].astype(float).clip(lower=0)
     return df
+
+
+def semanalizar_bonificado(bonificado: pd.DataFrame) -> pd.DataFrame:
+    """Agrega el bonificado diario a semanas ISO (lunes)."""
+    if bonificado.empty:
+        return pd.DataFrame(columns=["kopr", "semana", "bonificado"])
+    d = bonificado.copy()
+    d["semana"] = d["fecha"].map(lunes_de)
+    return d.groupby(["kopr", "semana"], as_index=False)["bonificado"].sum()
 
 
 def semanalizar(ventas_diarias: pd.DataFrame) -> pd.DataFrame:

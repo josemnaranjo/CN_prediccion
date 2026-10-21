@@ -136,3 +136,40 @@ def test_advertir_sin_novedad_no_emite_warning(caplog):
     caplog.set_level(logging.INFO)
     b.advertir_factores({"A": {"factor": 0.20, "factor_largo": 0.22}, "B": {"factor": None, "factor_largo": None}}, CFG)
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_query_incluye_gdi_sin_cambiar_el_filtro_de_venta():
+    q = b._query_ventas(Config())
+    assert "'GDI'" in q
+    assert "IN ('FCV','FDV','NCV','GDI')" in q          # WHERE de ambos tipos
+    assert "DDO.CAPRCO1" in q
+    assert "KOBO" not in q and "BOSULIDO" not in q       # mismo filtro que la venta: sin bodega
+    assert "GROUP BY RTRIM(DDO.KOPRCT), CONVERT(DATE, EDO.FEEMDO)" in q
+
+
+def test_separar_descarta_de_ventas_los_dias_sin_venta():
+    df = pd.DataFrame({
+        "kopr": ["A", "A", "B"],
+        "fecha": pd.to_datetime(["2026-10-05", "2026-10-06", "2026-10-06"]),
+        "unidades": [10.0, 0.0, 5.0],
+        "bonificado": [2.0, 3.0, 0.0],
+        "lineas_venta": [1, 0, 2],          # A/06-oct es un día solo con guías GDI
+    })
+    ventas, bonif = b.separar_ventas_y_bonificado(df)
+    assert list(ventas["kopr"]) == ["A", "B"] and list(ventas["unidades"]) == [10.0, 5.0]
+    assert list(ventas.columns) == ["kopr", "fecha", "unidades"]
+    assert list(bonif["kopr"]) == ["A", "A"] and list(bonif["bonificado"]) == [2.0, 3.0]
+    assert list(bonif.columns) == ["kopr", "fecha", "bonificado"]
+
+
+def test_semanalizar_bonificado_agrupa_por_lunes():
+    bonif = pd.DataFrame({"kopr": ["A", "A", "A"],
+                          "fecha": pd.to_datetime(["2026-10-05", "2026-10-11", "2026-10-12"]),
+                          "bonificado": [1.0, 2.0, 4.0]})
+    r = b.semanalizar_bonificado(bonif).set_index("semana")["bonificado"]
+    assert r[date(2026, 10, 5)] == 3.0 and r[date(2026, 10, 12)] == 4.0
+
+
+def test_semanalizar_bonificado_vacio():
+    r = b.semanalizar_bonificado(pd.DataFrame(columns=["kopr", "fecha", "bonificado"]))
+    assert list(r.columns) == ["kopr", "semana", "bonificado"] and r.empty
