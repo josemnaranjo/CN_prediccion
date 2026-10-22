@@ -83,3 +83,104 @@ def test_leer_movimientos_stock_aplica_signo_y_tipos(monkeypatch):
     assert type(df["semana"].iloc[0]) is date
     assert df["flujo_neto"].dtype == float
     assert "FEEMDO < '2026-10-12'" in capturado["query"]
+
+
+# ---------------------------------------------------------------------------
+# Task 3: cierres semanales y ancla
+# ---------------------------------------------------------------------------
+import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+TZ = "America/Santiago"
+
+
+def _cap(filas):
+    """filas: (kopr, 'YYYY-MM-DD HH:MM', valor)."""
+    return pd.DataFrame({
+        "kopr": [f[0] for f in filas],
+        "stock_fisico": [float(f[2]) for f in filas],
+        "capturado_en": [pd.Timestamp(f[1], tz=TZ) for f in filas],
+    })
+
+
+def test_cierre_es_el_lunes_de_madrugada():
+    caps = _cap([("A", "2026-10-11 00:05", 90), ("A", "2026-10-12 00:05", 100)])
+    c = bp.cierres_semanales(caps, Config())
+    assert len(c) == 1
+    assert c.iloc[0]["semana"] == date(2026, 10, 5)
+    assert c.iloc[0]["stock_fin"] == 100
+
+
+def test_captura_de_la_tarde_no_cierra_nada():
+    caps = _cap([("A", "2026-10-12 00:05", 100), ("A", "2026-10-12 15:30", 999),
+                 ("A", "2026-10-19 15:30", 777)])
+    c = bp.cierres_semanales(caps, Config())
+    assert list(c["semana"]) == [date(2026, 10, 5)]
+    assert c.iloc[0]["stock_fin"] == 100
+
+
+def test_varias_madrugadas_gana_la_mas_temprana():
+    caps = _cap([("A", "2026-10-12 00:40", 110), ("A", "2026-10-12 00:05", 100)])
+    c = bp.cierres_semanales(caps, Config())
+    assert len(c) == 1
+    assert c.iloc[0]["stock_fin"] == 100
+
+
+def _cierres_dos_lunes():
+    caps = _cap([("A", "2026-10-12 00:05", 100), ("A", "2026-10-19 00:05", 80)])
+    return bp.cierres_semanales(caps, Config())
+
+
+def test_ancla_exige_antiguedad_minima():
+    c = _cierres_dos_lunes()
+    z = ZoneInfo(TZ)
+    a = bp.elegir_ancla_de(c, Config(), datetime(2026, 10, 22, 12, 0, tzinfo=z))
+    assert a.semana == date(2026, 10, 5)
+    assert a.antiguedad_dias == 10
+    assert bp.elegir_ancla_de(c, Config(), datetime(2026, 10, 21, 12, 0, tzinfo=z)) is None
+
+
+def test_ancla_loguea_la_eleccion(caplog):
+    c = _cierres_dos_lunes()
+    with caplog.at_level(logging.INFO, logger="batch_jnc"):
+        bp.elegir_ancla_de(c, Config(), datetime(2026, 10, 22, 12, 0, tzinfo=ZoneInfo(TZ)))
+    assert "2026-10-05" in caplog.text
+    assert "10" in caplog.text
+
+
+def test_ancla_none_registra_la_razon(caplog):
+    vacio = bp.cierres_semanales(_cap([("A", "2026-10-12 15:30", 1)]), Config())
+    with caplog.at_level(logging.INFO, logger="batch_jnc"):
+        a = bp.elegir_ancla_de(vacio, Config(), datetime(2026, 10, 22, tzinfo=ZoneInfo(TZ)))
+    assert a is None
+    assert "no se reconstruye" in caplog.text
+
+
+def test_ancla_trae_el_stock_de_todos_los_skus():
+    caps = _cap([("A", "2026-10-12 00:05", 100), ("B", "2026-10-12 00:06", 50)])
+    c = bp.cierres_semanales(caps, Config())
+    a = bp.elegir_ancla_de(c, Config(), datetime(2026, 10, 30, tzinfo=ZoneInfo(TZ)))
+    assert a.stock == {"A": 100.0, "B": 50.0}
+
+
+def test_elegir_ancla_lee_postgres():
+    visto = {}
+
+    class Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None):
+            visto["sql"], visto["params"] = sql, params
+        def fetchall(self):
+            return [("A", Decimal("100.00"), datetime(2026, 10, 12, 0, 5, tzinfo=ZoneInfo(TZ)))]
+
+    class Conn:
+        def cursor(self): return Cur()
+
+    cfg = Config()
+    a = bp.elegir_ancla(Conn(), cfg, ahora=datetime(2026, 10, 30, tzinfo=ZoneInfo(TZ)))
+    assert "stock_snapshot" in visto["sql"]
+    assert "bodega" in visto["sql"]
+    assert cfg.bodega in tuple(visto["params"])
+    assert a.stock == {"A": 100.0}

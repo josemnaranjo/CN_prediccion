@@ -43,7 +43,8 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -997,6 +998,81 @@ def guardar_metricas(conn, batch_id: int, metricas: list[dict]) -> None:
             VALUES %s
         """, filas)
     conn.commit()
+
+
+# ============================================================================
+# Inventario histórico: cierres semanales y ancla
+# ============================================================================
+# Una captura tomada a las 00:0x del día D refleja el cierre del día D-1. Por
+# eso la captura que cierra una semana ISO es la del lunes de madrugada. El
+# cierre se calcula a partir de la hora local, nunca se asume.
+
+@dataclass(frozen=True)
+class Ancla:
+    semana: date              # lunes de la semana que la captura cierra
+    capturado_en: datetime
+    antiguedad_dias: int
+    stock: dict               # kopr -> stock al cierre
+
+
+def cierres_semanales(capturas: pd.DataFrame, cfg: Config = CONFIG) -> pd.DataFrame:
+    """Una fila (kopr, semana, stock_fin, capturado_en) por cierre semanal real."""
+    cols = ["kopr", "semana", "stock_fin", "capturado_en"]
+    if capturas is None or capturas.empty:
+        return pd.DataFrame(columns=cols)
+    df = capturas.copy()
+    local = pd.to_datetime(df["capturado_en"], utc=True).dt.tz_convert(cfg.zona_horaria)
+    df["capturado_en"] = local
+    df["_fecha"] = local.dt.date
+    df = df[(local.dt.weekday == 0) & (local.dt.hour < cfg.hora_madrugada_max)]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    df = df.sort_values("capturado_en").drop_duplicates(["kopr", "_fecha"], keep="first")
+    df["semana"] = df["_fecha"].map(lambda f: f - timedelta(days=7))
+    df = df.rename(columns={"stock_fisico": "stock_fin"})
+    return df[cols].reset_index(drop=True)
+
+
+def elegir_ancla_de(cierres: pd.DataFrame, cfg: Config,
+                    ahora: datetime) -> Ancla | None:
+    """Cierre más reciente con al menos `dias_minimos_ancla` de antigüedad."""
+    if cierres is None or cierres.empty:
+        log.info("Sin cierres semanales en stock_snapshot: no se reconstruye "
+                 "stock histórico")
+        return None
+    limite = ahora - timedelta(days=cfg.dias_minimos_ancla)
+    elegibles = cierres[cierres["capturado_en"] <= limite]
+    if elegibles.empty:
+        log.info("Ningún cierre semanal tiene %d días de antigüedad: no se "
+                 "reconstruye stock histórico", cfg.dias_minimos_ancla)
+        return None
+    semana = max(elegibles["semana"])
+    filas = elegibles[elegibles["semana"] == semana]
+    capturado = filas["capturado_en"].max().to_pydatetime()
+    antiguedad = (ahora - capturado).days
+    log.info("Ancla de stock: semana %s, capturada %s, antigüedad %d días",
+             semana, capturado.isoformat(), antiguedad)
+    return Ancla(semana=semana, capturado_en=capturado, antiguedad_dias=antiguedad,
+                 stock={str(k): float(v) for k, v in zip(filas["kopr"], filas["stock_fin"])})
+
+
+def leer_capturas(conn_pg, cfg: Config = CONFIG) -> pd.DataFrame:
+    with conn_pg.cursor() as cur:
+        cur.execute("""
+            SELECT kopr, stock_fisico, capturado_en
+            FROM predictions.stock_snapshot
+            WHERE bodega = %s
+        """, (cfg.bodega,))
+        filas = cur.fetchall()
+    df = pd.DataFrame(filas, columns=["kopr", "stock_fisico", "capturado_en"])
+    df["stock_fisico"] = df["stock_fisico"].astype(float)
+    return df
+
+
+def elegir_ancla(conn_pg, cfg: Config = CONFIG,
+                 ahora: datetime | None = None) -> Ancla | None:
+    ahora = ahora or datetime.now(ZoneInfo(cfg.zona_horaria))
+    return elegir_ancla_de(cierres_semanales(leer_capturas(conn_pg, cfg), cfg), cfg, ahora)
 
 
 def armar_filas_serie(tratado: pd.DataFrame, resultados: list[dict]) -> list[tuple]:
