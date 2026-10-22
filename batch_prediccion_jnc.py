@@ -107,6 +107,19 @@ class Config:
     bodega: str = "B01"              # bodega de despacho de JNC
     cobertura_aviso: float = 4.0     # semanas; bajo esto se avisa en el log
 
+    # --- Stock histórico ----------------------------------------------------
+    # Reconstrucción hacia atrás del stock semanal desde una captura ancla de
+    # stock_snapshot. Es un dato paralelo: no entra al modelo ni a las métricas.
+    # Con reconstruir_stock = False el job se comporta como antes.
+    reconstruir_stock: bool = True
+    dias_minimos_ancla: int = 10     # antigüedad mínima de la captura ancla
+    tido_entrada: tuple[str, ...] = ("FCC", "GRI", "GAR")      # suman stock
+    tido_salida: tuple[str, ...] = ("FCV", "FDV", "GDI")       # restan stock
+    tido_entrada_neg: tuple[str, ...] = ("NCC",)  # devolución de compra: resta
+    tido_salida_neg: tuple[str, ...] = ("NCV",)   # devolución de venta: suma
+    zona_horaria: str = "America/Santiago"  # para ubicar "lunes de madrugada"
+    hora_madrugada_max: int = 6      # capturas locales antes de esta hora cuentan como cierre
+
     # --- Operación ----------------------------------------------------------
     skus: tuple[str, ...] = SKUS_TESIS
     bloque_acumulado: int = 4        # tamaño del bloque para el MAPE acumulado
@@ -136,6 +149,18 @@ class Config:
             raise ValueError(
                 f"tido_bonificacion {self.tido_bonificacion} no puede incluir "
                 f"tipos de venta {TIPOS_VENTA}: se contaría doble")
+        grupos = {"tido_entrada": self.tido_entrada,
+                  "tido_salida": self.tido_salida,
+                  "tido_entrada_neg": self.tido_entrada_neg,
+                  "tido_salida_neg": self.tido_salida_neg}
+        nombres = list(grupos)
+        for i, a in enumerate(nombres):
+            for b_ in nombres[i + 1:]:
+                comunes = set(grupos[a]) & set(grupos[b_])
+                if comunes:
+                    raise ValueError(
+                        f"{a} y {b_} no pueden compartir tipos de documento "
+                        f"{sorted(comunes)}: el stock se contaría doble")
         p, d, q = self.orden_arima
         self.nombre_modelo = f"ARIMA({p},{d},{q})"
 
