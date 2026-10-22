@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS predictions.stock_historico (
     flujo_neto    NUMERIC(14,2) NOT NULL,
     origen        VARCHAR(12)   NOT NULL,
     PRIMARY KEY (batch_run_id, kopr, bodega, semana),
-    CONSTRAINT stock_historico_lunes   CHECK (EXTRACT(ISODOW FROM semana) = 1),
+    CONSTRAINT stock_historico_semana_lunes CHECK (EXTRACT(ISODOW FROM semana) = 1),
     CONSTRAINT stock_historico_origen  CHECK (origen IN ('reconstruido', 'capturado'))
 );
 

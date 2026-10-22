@@ -35,4 +35,6 @@ def test_migracion_007_forma():
     assert "EXTRACT(ISODOW FROM semana) = 1" in sql
     assert "origen IN ('reconstruido', 'capturado')" in sql
     assert "REFERENCES predictions.batch_run(id)" in sql
+    assert "stock_historico_semana_lunes" in sql
+    assert "stock_historico_origen" in sql
     assert "INTEGER" not in sql.upper()
