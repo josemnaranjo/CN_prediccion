@@ -61,8 +61,8 @@ def test_query_movimientos_elementos_obligatorios():
     assert "% 7" in sql
     for t in ("FCC", "GRI", "GAR", "NCV", "FCV", "FDV", "GDI", "NCC"):
         assert f"'{t}'" in sql
-    assert "FEEMDO >= '2026-01-05'" in sql
-    assert "FEEMDO < '2026-10-12'" in sql
+    assert "FEEMDO >= '20260105'" in sql
+    assert "FEEMDO < '20261012'" in sql
 
 
 def test_leer_movimientos_stock_aplica_signo_y_tipos(monkeypatch):
@@ -82,7 +82,7 @@ def test_leer_movimientos_stock_aplica_signo_y_tipos(monkeypatch):
     assert df["semana"].iloc[0] == date(2026, 10, 5)
     assert type(df["semana"].iloc[0]) is date
     assert df["flujo_neto"].dtype == float
-    assert "FEEMDO < '2026-10-12'" in capturado["query"]
+    assert "FEEMDO < '20261012'" in capturado["query"]
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +373,14 @@ class _Cx:
         return False
 
 
+class _Pg:
+    def __init__(self):
+        self.rollbacks = 0
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
 def _ancla():
     return bp.Ancla(semana=date(2026, 10, 12), capturado_en=None,
                     antiguedad_dias=1, stock={"A": 5.0})
@@ -386,12 +394,12 @@ def test_generar_sin_ancla_no_guarda_y_no_falla(monkeypatch):
                         lambda *a, **k: llamadas.append("mov"))
     monkeypatch.setattr(bp, "guardar_stock_historico",
                         lambda *a, **k: llamadas.append("guardar"))
-    assert bp.generar_stock_historico(object(), 7, date(2025, 1, 6), Config()) == 0
+    assert bp.generar_stock_historico(_Pg(), 7, date(2025, 1, 6), Config()) == 0
     assert llamadas == []
 
 
 def test_generar_encadena_los_pasos(monkeypatch):
-    cfg = Config()
+    cfg = Config(skus=("A",))
     ancla = _ancla()
     inicio = date(2025, 1, 6)
     visto = {}
@@ -415,7 +423,7 @@ def test_generar_encadena_los_pasos(monkeypatch):
     monkeypatch.setattr(bp, "guardar_stock_historico",
                         lambda conn, bid, bod, s: visto.update(gua=(bid, bod, s)))
 
-    assert bp.generar_stock_historico(object(), 42, inicio, cfg) == 2
+    assert bp.generar_stock_historico(_Pg(), 42, inicio, cfg) == 2
     assert visto["mov"] == (inicio, ancla.semana)
     assert visto["rec"] == (ancla, "MOV", inicio)
     assert visto["cal"] == "REC"
@@ -518,3 +526,50 @@ def test_main_dry_run_no_reconstruye(corrida):
     eventos, _ = corrida
     assert bp.main(["--dry-run"]) == 0
     assert eventos == []
+
+
+def test_generar_limita_la_ancla_a_cfg_skus_y_cierra_la_lectura(monkeypatch):
+    cfg = Config(skus=("A",))
+    ancla = bp.Ancla(semana=date(2026, 10, 12), capturado_en=None, antiguedad_dias=1,
+                     stock={"A": 5.0, "OTRO": 9.0})
+    pg = _Pg()
+    visto = {}
+    monkeypatch.setattr(bp, "elegir_ancla", lambda conn, c: ancla)
+    monkeypatch.setattr(bp, "conectar_mssql",
+                        lambda: visto.update(rb=pg.rollbacks) or _Cx())
+    monkeypatch.setattr(bp, "leer_movimientos_stock", lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(bp, "leer_capturas", lambda conn, c: None)
+    monkeypatch.setattr(bp, "cierres_semanales",
+                        lambda cap, c: pd.DataFrame(columns=["kopr", "semana", "stock_fin"]))
+    monkeypatch.setattr(bp, "armar_serie_historica", lambda rec, cie, a: rec)
+    monkeypatch.setattr(bp, "guardar_stock_historico",
+                        lambda conn, bid, bod, s: visto.update(serie=s))
+    bp.generar_stock_historico(pg, 1, date(2026, 10, 5), cfg)
+    assert set(visto["serie"]["kopr"]) == {"A"}
+    assert visto["rb"] == 1  # lectura cerrada antes de abrir Softland
+
+
+def test_main_rollback_que_falla_no_impide_cerrar_ok(corrida, monkeypatch):
+    eventos, _ = corrida
+
+    def falla(*a, **k):
+        raise RuntimeError("boom")
+
+    class Caida(_Conn):
+        closed = 1
+
+        def rollback(self):
+            raise RuntimeError("conexion caida")
+
+    nuevas = []
+
+    def conectar():
+        c = _Conn(eventos) if nuevas or not eventos else _Conn(eventos)
+        nuevas.append(c)
+        return Caida(eventos) if len(nuevas) == 1 else c
+    monkeypatch.setattr(bp, "conectar_postgres", conectar)
+    monkeypatch.setattr(bp, "generar_stock_historico", falla)
+    assert bp.main([]) == 0
+    assert len(nuevas) == 2  # reconectó
+    assert ("cerrar", "ok") in eventos
+    assert ("cerrar", "error") not in eventos

@@ -42,7 +42,7 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -397,8 +397,8 @@ def _query_movimientos(cfg: Config, desde: date, hasta_excl: date) -> str:
     WHERE EDO.TIDO IN ({_lista_sql(list(signos))})
       AND DDO.BOSULIDO = '{cfg.bodega}'
       AND RTRIM(DDO.KOPRCT) IN ({_lista_sql(cfg.skus)})
-      AND EDO.FEEMDO >= '{desde.isoformat()}'
-      AND EDO.FEEMDO < '{hasta_excl.isoformat()}'
+      AND EDO.FEEMDO >= '{desde.strftime('%Y%m%d')}'
+      AND EDO.FEEMDO < '{hasta_excl.strftime('%Y%m%d')}'
     GROUP BY RTRIM(DDO.KOPRCT), {lunes}
     """
 
@@ -1271,6 +1271,9 @@ def generar_stock_historico(conn_pg, batch_id: int, inicio: date, cfg: Config) -
     if ancla is None:
         log.warning("Stock histórico: no hay captura de cierre utilizable; se omite")
         return 0
+    conn_pg.rollback()  # cierra la transacción de lectura antes de ir a Softland
+    skus = set(cfg.skus)
+    ancla = dc_replace(ancla, stock={k: v for k, v in ancla.stock.items() if k in skus})
     with conectar_mssql() as cx:
         movimientos = leer_movimientos_stock(cx, cfg, inicio, ancla.semana)
     reconstruido = reconstruir_stock_historico(ancla, movimientos, cfg, inicio)
@@ -1412,7 +1415,13 @@ def main(argv: list[str] | None = None) -> int:
                 generar_stock_historico(conn, batch_id, inicio, cfg)
             except Exception:  # noqa: BLE001 — el histórico no debe tumbar la corrida
                 log.exception("Stock histórico falló; la corrida %d sigue como ok", batch_id)
-                conn.rollback()  # una transacción abortada rompería cerrar_corrida
+                try:  # una transacción abortada rompería cerrar_corrida
+                    conn.rollback()
+                except Exception:  # noqa: BLE001
+                    log.exception("rollback falló tras el error del stock histórico")
+                if getattr(conn, "closed", 0):
+                    log.warning("Conexión PostgreSQL cerrada; se reconecta para cerrar la corrida")
+                    conn = conectar_postgres()
         cerrar_corrida(conn, batch_id, "ok", len(resultados), len(fallidos),
                        time.time() - t0)
         log.info("Corrida %d guardada.", batch_id)
