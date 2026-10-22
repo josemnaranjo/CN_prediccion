@@ -360,6 +360,59 @@ def leer_stock_mssql(conn, cfg: Config = CONFIG) -> pd.DataFrame:
     return df
 
 
+def signos_tido(cfg: Config = CONFIG) -> dict[str, int]:
+    """Signo con que cada tipo de documento mueve el stock de la bodega.
+
+    Entradas y notas de venta (devuelven mercadería) suman; salidas y notas de
+    compra (devuelven al proveedor) restan.
+    """
+    signos = {t: 1 for t in cfg.tido_entrada + cfg.tido_salida_neg}
+    signos.update({t: -1 for t in cfg.tido_salida + cfg.tido_entrada_neg})
+    return signos
+
+
+def _query_movimientos(cfg: Config, desde: date, hasta_excl: date) -> str:
+    """Flujo neto semanal por SKU en la bodega, con el signo ya aplicado.
+
+    No se agrega a `_query_ventas`: esa consulta es la validada contra el
+    dataset de entrenamiento y la reconciliación del stock es unidad por
+    unidad, así que cada una conserva su propio filtro y su propio conjunto de
+    documentos. Aquí la bodega es DDO.BOSULIDO y la semana es el lunes de
+    FEEMDO (1900-01-01 fue lunes).
+    """
+    signos = signos_tido(cfg)
+    mas = _lista_sql([t for t, s in signos.items() if s > 0])
+    menos = _lista_sql([t for t, s in signos.items() if s < 0])
+    lunes = "DATEADD(DAY, -(DATEDIFF(DAY, '19000101', EDO.FEEMDO) % 7), CONVERT(DATE, EDO.FEEMDO))"
+    return f"""
+    SELECT
+      RTRIM(DDO.KOPRCT) AS kopr,
+      {lunes} AS semana,
+      SUM(CASE WHEN EDO.TIDO IN ({mas}) THEN DDO.CAPRCO1
+               WHEN EDO.TIDO IN ({menos}) THEN -DDO.CAPRCO1
+          END) AS flujo_neto
+    FROM dbo.MAEEDO AS EDO WITH (NOLOCK)
+    INNER JOIN dbo.MAEDDO AS DDO WITH (NOLOCK) ON EDO.IDMAEEDO = DDO.IDMAEEDO
+    WHERE EDO.TIDO IN ({_lista_sql(list(signos))})
+      AND DDO.BOSULIDO = '{cfg.bodega}'
+      AND RTRIM(DDO.KOPRCT) IN ({_lista_sql(cfg.skus)})
+      AND EDO.FEEMDO >= '{desde.isoformat()}'
+      AND EDO.FEEMDO < '{hasta_excl.isoformat()}'
+    GROUP BY RTRIM(DDO.KOPRCT), {lunes}
+    """
+
+
+def leer_movimientos_stock(conn, cfg: Config, desde: date,
+                           semana_ancla: date) -> pd.DataFrame:
+    """Flujo neto semanal por SKU desde `desde` hasta la semana ancla inclusive."""
+    hasta_excl = semana_ancla + timedelta(days=7)
+    df = pd.read_sql(_query_movimientos(cfg, desde, hasta_excl), conn)
+    df["kopr"] = df["kopr"].astype(str).str.strip()
+    df["semana"] = pd.to_datetime(df["semana"]).dt.date
+    df["flujo_neto"] = df["flujo_neto"].astype(float)
+    return df
+
+
 def semanalizar_bonificado(bonificado: pd.DataFrame) -> pd.DataFrame:
     """Agrega el bonificado diario a semanas ISO (lunes)."""
     if bonificado.empty:
