@@ -71,9 +71,14 @@ TIPOS_NEGATIVOS: frozenset[str] = frozenset({"NCV"})
 class Config:
     # --- Ventana de datos ---------------------------------------------------
     meses_historia: int = 42        # se leen 42 meses y se usan los que hagan falta
-    semanas_entrenamiento: int = 78  # 18 meses, igual que en el estudio
-    semanas_backtest: int = 12       # tramo de evaluación, igual que el set de prueba
-    min_semanas_sku: int = 30        # mínimo para intentar modelar un SKU
+    semanas_entrenamiento: int = 78   # 18 meses, igual que en el estudio
+    semanas_evaluacion: int = 12      # ventana de las métricas. NO cambiar: define
+                                      # las cifras reportadas en la tesis
+    semanas_backtest: int | None = None  # ventana dibujada; None = todo lo posible
+    semanas_refit: int = 12           # cada cuántas semanas se reestima el modelo;
+                                      # debe ser igual a semanas_evaluacion para que
+                                      # las métricas sigan comparables con el estudio
+    min_semanas_sku: int = 30         # mínimo para intentar modelar un SKU
 
     # --- Modelo -------------------------------------------------------------
     orden_arima: tuple[int, int, int] = (1, 1, 1)
@@ -106,9 +111,31 @@ class Config:
     skus: tuple[str, ...] = SKUS_TESIS
     bloque_acumulado: int = 4        # tamaño del bloque para el MAPE acumulado
 
+    # --- Bonificación (GDI) -------------------------------------------------
+    # Mercadería bonificada ("compras 4, te regalo 1"): sale de la bodega pero no
+    # aparece en ninguna factura. El factor es un dato paralelo a la demanda: no
+    # entra al entrenamiento ni a las métricas.
+    semanas_factor_bonif: int = 13   # ventana del factor, en semanas cerradas
+    semanas_factor_largo: int = 52   # solo para advertir deriva de la mecánica comercial
+    tido_bonificacion: tuple[str, ...] = ("GDI",)
+    skus_sin_factor: tuple[str, ...] = ("5131012",)  # unidad de bonificado ≠ unidad de venta
+    factor_bonif_maximo: float = 0.60    # sobre esto, solo advierte
+    umbral_deriva_factor: float = 0.10   # |factor13 - factor52| sobre esto, advierte
+
     nombre_modelo: str = field(init=False)
 
     def __post_init__(self) -> None:
+        if (self.semanas_backtest is not None
+                and self.semanas_backtest < self.semanas_evaluacion):
+            raise ValueError(
+                f"semanas_backtest ({self.semanas_backtest}) debe ser >= "
+                f"semanas_evaluacion ({self.semanas_evaluacion})")
+        if self.semanas_refit <= 0:
+            raise ValueError(f"semanas_refit ({self.semanas_refit}) debe ser > 0")
+        if set(self.tido_bonificacion) & set(TIPOS_VENTA):
+            raise ValueError(
+                f"tido_bonificacion {self.tido_bonificacion} no puede incluir "
+                f"tipos de venta {TIPOS_VENTA}: se contaría doble")
         p, d, q = self.orden_arima
         self.nombre_modelo = f"ARIMA({p},{d},{q})"
 
@@ -218,33 +245,60 @@ def _lista_sql(valores) -> str:
     return ",".join(f"'{v}'" for v in valores)
 
 
-def leer_ventas_mssql(conn, cfg: Config = CONFIG) -> pd.DataFrame:
-    """Ventas diarias por SKU desde Softland.
-
-    Esta consulta es la que quedó validada en la reconciliación del 29-09-2026
-    contra el dataset de entrenamiento. Cualquier cambio en los tipos de
-    documento, en la columna de cantidad o en la clave de producto rompe la
-    equivalencia con los datos sobre los que se midió el error del modelo.
-    """
-    query = f"""
+def _query_ventas(cfg: Config) -> str:
+    venta = _lista_sql(TIPOS_VENTA)
+    negativos = _lista_sql(TIPOS_NEGATIVOS)
+    bonif = _lista_sql(cfg.tido_bonificacion)
+    return f"""
     SELECT
       RTRIM(DDO.KOPRCT) AS kopr,
       CONVERT(DATE, EDO.FEEMDO) AS fecha,
-      SUM(DDO.CAPRCO1 * CASE WHEN EDO.TIDO IN ({_lista_sql(TIPOS_NEGATIVOS)})
-                             THEN -1 ELSE 1 END) AS unidades
+      SUM(CASE WHEN EDO.TIDO IN ({venta})
+               THEN DDO.CAPRCO1 * CASE WHEN EDO.TIDO IN ({negativos}) THEN -1 ELSE 1 END
+               ELSE 0 END) AS unidades,
+      SUM(CASE WHEN EDO.TIDO IN ({bonif}) THEN DDO.CAPRCO1 ELSE 0 END) AS bonificado,
+      SUM(CASE WHEN EDO.TIDO IN ({venta}) THEN 1 ELSE 0 END) AS lineas_venta
     FROM dbo.MAEEDO AS EDO WITH (NOLOCK)
     INNER JOIN dbo.MAEDDO AS DDO WITH (NOLOCK) ON EDO.IDMAEEDO = DDO.IDMAEEDO
-    WHERE EDO.TIDO IN ({_lista_sql(TIPOS_VENTA)})
+    WHERE EDO.TIDO IN ({_lista_sql(TIPOS_VENTA + tuple(cfg.tido_bonificacion))})
       AND EDO.FEEMDO >= DATEADD(MONTH, -{cfg.meses_historia}, GETDATE())
       AND EDO.FEEMDO <  DATEADD(DAY, 1, GETDATE())
       AND RTRIM(DDO.KOPRCT) IN ({_lista_sql(cfg.skus)})
     GROUP BY RTRIM(DDO.KOPRCT), CONVERT(DATE, EDO.FEEMDO)
     """
-    df = pd.read_sql(query, conn)
+
+
+def separar_ventas_y_bonificado(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Parte el resultado de `_query_ventas` en la venta y el bonificado.
+
+    La venta conserva solo los días con al menos una línea de venta, que son
+    exactamente las filas que devolvía la consulta antes de agregar GDI. Un
+    día con solo guías de bonificado no debe aparecer ahí: ampliaría la grilla
+    de semanas y movería la historia sobre la que se midió el modelo.
+    """
+    ventas = (df.loc[df["lineas_venta"] > 0, ["kopr", "fecha", "unidades"]]
+                .reset_index(drop=True))
+    bonificado = (df.loc[df["bonificado"] != 0, ["kopr", "fecha", "bonificado"]]
+                    .reset_index(drop=True))
+    return ventas, bonificado
+
+
+def leer_ventas_mssql(conn, cfg: Config = CONFIG) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Ventas diarias por SKU y bonificado diario, desde Softland, en una sola pasada.
+
+    La parte de venta es la consulta validada en la reconciliación del
+    29-09-2026 contra el dataset de entrenamiento. Cualquier cambio en los tipos
+    de documento, en la columna de cantidad o en la clave de producto rompe la
+    equivalencia con los datos sobre los que se midió el error del modelo; por
+    eso el bonificado solo se *agrega* como segundo agregado y la venta que se
+    devuelve es la misma de antes.
+    """
+    df = pd.read_sql(_query_ventas(cfg), conn)
     df["kopr"] = df["kopr"].astype(str).str.strip()
     df["fecha"] = pd.to_datetime(df["fecha"])
     df["unidades"] = df["unidades"].astype(float)
-    return df
+    df["bonificado"] = df["bonificado"].astype(float)
+    return separar_ventas_y_bonificado(df)
 
 
 def leer_productos_mssql(conn, cfg: Config = CONFIG) -> pd.DataFrame:
@@ -281,6 +335,15 @@ def leer_stock_mssql(conn, cfg: Config = CONFIG) -> pd.DataFrame:
     return df
 
 
+def semanalizar_bonificado(bonificado: pd.DataFrame) -> pd.DataFrame:
+    """Agrega el bonificado diario a semanas ISO (lunes)."""
+    if bonificado.empty:
+        return pd.DataFrame(columns=["kopr", "semana", "bonificado"])
+    d = bonificado.copy()
+    d["semana"] = d["fecha"].map(lunes_de)
+    return d.groupby(["kopr", "semana"], as_index=False)["bonificado"].sum()
+
+
 def semanalizar(ventas_diarias: pd.DataFrame) -> pd.DataFrame:
     """Agrega las ventas diarias a semanas ISO, identificadas por su lunes."""
     d = ventas_diarias.copy()
@@ -307,6 +370,11 @@ def leer_ventas_csv(ruta: str) -> pd.DataFrame:
     return d[["kopr", "semana", "demanda"]]
 
 
+def ultima_semana_cerrada(hoy: date | None = None) -> date:
+    """Lunes de la última semana ISO completa (la semana en curso no cuenta)."""
+    return lunes_de(hoy or date.today()) - timedelta(weeks=1)
+
+
 def completar_grilla(semanal: pd.DataFrame, cfg: Config = CONFIG) -> pd.DataFrame:
     """Rellena con cero las semanas sin movimiento y recorta la última semana.
 
@@ -317,7 +385,7 @@ def completar_grilla(semanal: pd.DataFrame, cfg: Config = CONFIG) -> pd.DataFram
     if semanal.empty:
         return semanal
 
-    ultima_cerrada = lunes_de(date.today()) - timedelta(weeks=1)
+    ultima_cerrada = ultima_semana_cerrada()
     semanal = semanal[semanal["semana"] <= ultima_cerrada]
 
     inicio, fin = semanal["semana"].min(), semanal["semana"].max()
@@ -333,6 +401,90 @@ def completar_grilla(semanal: pd.DataFrame, cfg: Config = CONFIG) -> pd.DataFram
     # dataset de entrenamiento.
     d["demanda"] = d["demanda"].clip(lower=0.0)
     return d.sort_values(["kopr", "semana"]).reset_index(drop=True)
+
+
+# ============================================================================
+# Factor de bonificación
+# ============================================================================
+
+FACTOR_MAX_ALMACENABLE = 99.9999  # límite de NUMERIC(6,4)
+
+
+def _suma_ventana(df: pd.DataFrame | None, col: str, hasta: date, semanas: int) -> dict:
+    if df is None or df.empty:
+        return {}
+    desde = hasta - timedelta(weeks=semanas - 1)
+    d = df[(df["semana"] >= desde) & (df["semana"] <= hasta)]
+    return d.groupby("kopr")[col].sum().to_dict()
+
+
+def _razon_bonificacion(kopr: str, bonif: float, venta: float, semanas: int) -> float | None:
+    if venta <= 0:
+        return None
+    f = bonif / venta
+    if not 0 <= f < FACTOR_MAX_ALMACENABLE:
+        log.warning("  %s: factor de bonificación %.4f fuera de rango en %d semanas "
+                    "(bonificado %.0f, venta neta %.0f). Se deja sin factor.",
+                    kopr, f, semanas, bonif, venta)
+        return None
+    return float(f)
+
+
+def calcular_factores_bonificacion(ventas: pd.DataFrame, bonificado: pd.DataFrame | None,
+                                   ultima_cerrada: date,
+                                   cfg: Config = CONFIG) -> dict[str, dict[str, float | None]]:
+    """Bonificado sobre venta neta, agregado por SKU en la ventana y luego dividido.
+
+    No es el promedio de los factores semanales: semana a semana el factor es
+    errático porque la entrega del bonificado no cae en la semana de la factura.
+    Al agregar ese ruido de calendario desaparece, y como la tarjeta proyecta
+    cuatro semanas, el agregado es la escala que corresponde.
+
+    `ventas` es la venta neta semanal cruda (sin winsorizar). Con
+    `bonificado=None` (no hay fuente, p. ej. --desde-csv) devuelve {}.
+    """
+    if bonificado is None:
+        return {}
+
+    resultado: dict[str, dict[str, float | None]] = {}
+    ventanas = {"factor": cfg.semanas_factor_bonif, "factor_largo": cfg.semanas_factor_largo}
+    sumas = {clave: (_suma_ventana(ventas, "demanda", ultima_cerrada, n),
+                     _suma_ventana(bonificado, "bonificado", ultima_cerrada, n))
+             for clave, n in ventanas.items()}
+
+    for kopr in cfg.skus:
+        if kopr in cfg.skus_sin_factor:
+            resultado[kopr] = {"factor": None, "factor_largo": None}
+            continue
+        resultado[kopr] = {
+            clave: _razon_bonificacion(kopr, bon.get(kopr, 0.0), ven.get(kopr, 0.0), n)
+            for clave, n in ventanas.items()
+            for ven, bon in [sumas[clave]]
+        }
+    return resultado
+
+
+def advertir_factores(factores: dict, cfg: Config = CONFIG) -> None:
+    """Avisa de factores atípicos: reflejan decisiones comerciales que cambian sin aviso."""
+    if not factores:
+        return
+    con_factor = sum(1 for v in factores.values() if v["factor"] is not None)
+    log.info("Factor de bonificación (%d semanas): %d de %d SKUs con factor",
+             cfg.semanas_factor_bonif, con_factor, len(factores))
+    for kopr, v in sorted(factores.items()):
+        f, largo = v["factor"], v["factor_largo"]
+        if f is None:
+            continue
+        if f > cfg.factor_bonif_maximo:
+            log.warning("  %s: factor de bonificación %.1f%% sobre el máximo de %.0f%%. "
+                        "Se usa igual; verificar que no sea un error de datos.",
+                        kopr, 100 * f, 100 * cfg.factor_bonif_maximo)
+        if largo is not None and abs(f - largo) > cfg.umbral_deriva_factor:
+            log.warning("  %s: el factor de %d semanas (%.1f%%) difiere del de %d semanas "
+                        "(%.1f%%) en más de %.0f puntos: la mecánica comercial cambió.",
+                        kopr, cfg.semanas_factor_bonif, 100 * f,
+                        cfg.semanas_factor_largo, 100 * largo,
+                        100 * cfg.umbral_deriva_factor)
 
 
 # ============================================================================
@@ -462,53 +614,82 @@ def _ajustar(serie: np.ndarray, cfg: Config):
                    enforce_invertibility=False).fit(disp=False)
 
 
+def _n_dibujo(n_serie: int, cfg: Config) -> int:
+    """Semanas de backtest que se dibujan para una serie de largo `n_serie`."""
+    disponible = n_serie - cfg.semanas_entrenamiento
+    n = disponible if cfg.semanas_backtest is None else min(cfg.semanas_backtest, disponible)
+    n = max(n, cfg.semanas_evaluacion)   # nunca menos que la ventana de evaluación
+    return min(n, n_serie - 1)           # nunca toda la serie
+
+
+def _puntos_refit(n_serie: int, inicio: int, cfg: Config) -> list[int]:
+    """Posiciones donde se reestima el modelo, contadas hacia atrás desde el final.
+
+    Contar desde el final (y no desde el inicio) garantiza un reajuste justo al
+    comienzo de la ventana de evaluación y ninguno dentro de ella. Siempre
+    incluye `inicio`, que necesita un primer ajuste.
+    """
+    pts = {inicio}
+    p = n_serie - cfg.semanas_refit
+    while p > inicio:
+        pts.add(p)
+        p -= cfg.semanas_refit
+    return sorted(pts)
+
+
 def backtest_arima(serie: pd.Series,
                    cfg: Config = CONFIG) -> tuple[pd.Series, list[tuple[float, float]]]:
-    """Backtest sobre las últimas `semanas_backtest` semanas, en dos horizontes.
+    """Backtest con reajuste periódico sobre ventana móvil, en dos horizontes.
 
-    Se ajusta una vez sobre la ventana de entrenamiento y después se avanza
-    semana a semana incorporando el valor real observado, sin reestimar los
-    parámetros (`append(..., refit=False)`). Cada predicción usa solo
-    información anterior a la semana que estima.
+    La predicción a un paso se genera para toda la ventana de dibujo (ver
+    `_n_dibujo`). El modelo se reestima cada `semanas_refit` semanas sobre las
+    `semanas_entrenamiento` previas (solo datos anteriores); entre reajustes se
+    avanza con `append(..., refit=False)`. Cada predicción usa solo información
+    anterior a la semana que estima.
 
-    Devuelve dos cosas:
-
-    - la predicción **a un paso** de cada semana, que es la que se dibuja en
-      el gráfico como tramo de validación del modelo;
-    - los bloques de `bloque_acumulado` semanas, cada uno pronosticado de una
-      sola vez desde el inicio del bloque, sin conocer ninguna de sus semanas.
-      Este segundo horizonte es el que corresponde a lo que hace el producto
-      —proyectar cuatro semanas hacia adelante— y por lo tanto el que debe
-      sustentar la métrica que se muestra en la vista de cuatro semanas.
-      Sumar predicciones a un paso daría un error mucho menor y engañoso,
-      porque cada una conoce el resultado de la semana anterior.
+    Los bloques acumulados de `bloque_acumulado` semanas se calculan solo dentro
+    de la ventana de evaluación (las últimas `semanas_evaluacion`), alineados a
+    su inicio, cada uno pronosticado de una sola vez desde su comienzo, a ciegas.
+    Sumar predicciones a un paso daría un error mucho menor y engañoso.
     """
-    n_test = cfg.semanas_backtest
-    entrenamiento = serie.iloc[:-n_test]
-    prueba = serie.iloc[-n_test:]
+    N = len(serie)
+    n = _n_dibujo(N, cfg)
+    inicio = N - n
+    if inicio < cfg.min_semanas_sku:
+        return pd.Series(np.nan, index=serie.index[inicio:]), []
 
-    if len(entrenamiento) < cfg.min_semanas_sku:
-        return pd.Series(np.nan, index=prueba.index), []
-
-    ventana = entrenamiento.iloc[-cfg.semanas_entrenamiento:]
-    res = _ajustar(ventana.values.astype(float), cfg)
-
+    eval_ini = N - cfg.semanas_evaluacion
+    refits = set(_puntos_refit(N, inicio, cfg))
     B = cfg.bloque_acumulado
-    valores = prueba.values.astype(float)
+    valores = serie.values.astype(float)
+
     pred_1paso: list[float] = []
     bloques: list[tuple[float, float]] = []
-
-    for i in range(0, n_test, B):
-        tramo = valores[i:i + B]
-        if len(tramo) == B:
+    res = None
+    for i in range(inicio, N):
+        if i in refits:
+            ventana = valores[max(0, i - cfg.semanas_entrenamiento):i]
+            if i < eval_ini:
+                # Solo alimenta la línea dibujada: un fallo no debe perder el SKU.
+                try:
+                    res = _ajustar(ventana, cfg)
+                except Exception as e:
+                    log.warning("backtest: falló el reajuste en i=%d (%s); "
+                                "predicciones NaN hasta el próximo reajuste", i, e)
+                    res = None
+            else:
+                res = _ajustar(ventana, cfg)   # ventana de evaluación: sin protección
+        if res is None:
+            pred_1paso.append(float("nan"))
+            continue
+        if i >= eval_ini and (i - eval_ini) % B == 0 and i + B <= N:
             # Pronóstico de todo el bloque desde su inicio, a ciegas.
             f = np.clip(np.asarray(res.forecast(B), dtype=float), 0, None)
-            bloques.append((float(tramo.sum()), float(f.sum())))
-        for real in tramo:
-            pred_1paso.append(float(np.clip(res.forecast(1)[0], 0, None)))
-            res = res.append([real], refit=False)
+            bloques.append((float(valores[i:i + B].sum()), float(f.sum())))
+        pred_1paso.append(float(np.clip(res.forecast(1)[0], 0, None)))
+        res = res.append([valores[i]], refit=False)
 
-    return pd.Series(pred_1paso, index=prueba.index), bloques
+    return pd.Series(pred_1paso, index=serie.index[inicio:]), bloques
 
 
 def proyectar_arima(serie: pd.Series, cfg: Config = CONFIG) -> pd.DataFrame:
@@ -572,7 +753,7 @@ def procesar_sku(kopr: str, g: pd.DataFrame, cfg: Config = CONFIG) -> dict | Non
     g = g.sort_values("semana")
     serie = pd.Series(g["demanda"].values, index=list(g["semana"]), dtype=float)
 
-    minimo = cfg.min_semanas_sku + cfg.semanas_backtest
+    minimo = cfg.min_semanas_sku + cfg.semanas_evaluacion
     if len(serie) < minimo:
         log.warning("%s: %d semanas, se requieren %d. Se omite.",
                     kopr, len(serie), minimo)
@@ -582,32 +763,38 @@ def procesar_sku(kopr: str, g: pd.DataFrame, cfg: Config = CONFIG) -> dict | Non
                  if "censurada" in g else pd.Series(False, index=serie.index))
 
     pred_backtest, bloques_pron = backtest_arima(serie, cfg)
-    reales = serie.loc[pred_backtest.index]
-    cens_test = censurada.loc[pred_backtest.index].to_numpy(bool)
+
+    # Las métricas salen solo de la ventana de evaluación; el resto del
+    # backtest es únicamente para dibujar la línea del modelo.
+    eval_idx = pred_backtest.index[-cfg.semanas_evaluacion:]
+    reales_eval = serie.loc[eval_idx]
+    pred_eval = pred_backtest.loc[eval_idx]
+    cens_eval = censurada.loc[eval_idx].to_numpy(bool)
 
     # Un bloque acumulado se descarta completo si alguna de sus semanas está
     # censurada: su suma tampoco representa la demanda del período.
     B = cfg.bloque_acumulado
     bloques_limpios = [b for i, b in enumerate(bloques_pron)
-                       if not cens_test[i * B:(i + 1) * B].any()]
+                       if not cens_eval[i * B:(i + 1) * B].any()]
 
-    m_sem = mape(reales.values, pred_backtest.values, excluir=cens_test)
+    m_sem = mape(reales_eval.values, pred_eval.values, excluir=cens_eval)
     m_acum, bloques = mape_bloques(bloques_limpios)
-    mae = float(np.abs(reales.values - pred_backtest.values).mean())
+    mae = float(np.abs(reales_eval.values - pred_eval.values).mean())
 
     # Sin stock en la última semana cerrada. La proyección se genera igual
     # —estima demanda, que existe aunque no haya producto— pero el dashboard
     # debe advertirlo: esa demanda no se va a concretar si no se repone.
-    en_quiebre = bool(cens_test[-1]) if len(cens_test) else False
+    en_quiebre = bool(cens_eval[-1]) if len(cens_eval) else False
 
     return {
         "kopr": kopr,
         "backtest": pred_backtest,
         "proyeccion": proyectar_arima(serie, cfg),
         "metricas": {
-            "semanas_backtest": int(len(pred_backtest)),
-            "semanas_para_mape": int(((reales.values != 0) & ~cens_test).sum()),
-            "semanas_censuradas": int(cens_test.sum()),
+            "semanas_backtest": int(len(pred_eval)),   # semanas de las métricas
+            "semanas_dibujo": int(len(pred_backtest)), # solo log; no se persiste
+            "semanas_para_mape": int(((reales_eval.values != 0) & ~cens_eval).sum()),
+            "semanas_censuradas": int(cens_eval.sum()),
             "mape_semanal": m_sem,
             "mae_semanal": mae,
             "mape_4sem": m_acum,
@@ -714,16 +901,21 @@ def guardar_metricas(conn, batch_id: int, metricas: list[dict]) -> None:
 
     if not metricas:
         return
+
+    def _factor(m):
+        f = _nulo(m.get("factor_bonificacion"))
+        return None if f is None else round(float(f), 4)
+
     filas = [(batch_id, m["kopr"], m["semanas_backtest"], m["semanas_para_mape"],
               m["semanas_censuradas"], _nulo(m["mape_semanal"]),
               _nulo(m["mae_semanal"]), _nulo(m["mape_4sem"]),
-              m["bloques_4sem"], m["en_quiebre"]) for m in metricas]
+              m["bloques_4sem"], m["en_quiebre"], _factor(m)) for m in metricas]
     with conn.cursor() as cur:
         execute_values(cur, """
             INSERT INTO predictions.metrica_sku
                 (batch_run_id, kopr, semanas_backtest, semanas_para_mape,
                  semanas_censuradas, mape_semanal, mae_semanal, mape_4sem,
-                 bloques_4sem, en_quiebre)
+                 bloques_4sem, en_quiebre, factor_bonificacion)
             VALUES %s
         """, filas)
     conn.commit()
@@ -764,7 +956,8 @@ def resumen(resultados: list[dict], cfg: Config) -> None:
     m = pd.DataFrame([r["metricas"] | {"kopr": r["kopr"]} for r in resultados])
     # Se reporta la mediana y no la media: con MAPE, un solo SKU de demanda
     # baja distorsiona el promedio en un orden de magnitud.
-    log.info("Resumen del backtest (%d semanas por SKU):", cfg.semanas_backtest)
+    log.info("Resumen del backtest (%d semanas evaluadas por SKU; línea dibujada de %d a %d semanas):",
+             cfg.semanas_evaluacion, int(m["semanas_dibujo"].min()), int(m["semanas_dibujo"].max()))
     log.info("  MAPE semanal    — mediana %.2f%% | SKUs sobre 100%%: %d de %d",
              m["mape_semanal"].median(), int((m["mape_semanal"] > 100).sum()), len(m))
     log.info("  MAPE %d semanas  — mediana %.2f%% | SKUs <= 20%%: %d de %d",
@@ -780,8 +973,9 @@ def resumen(resultados: list[dict], cfg: Config) -> None:
 
 
 def resumen_cobertura(resultados: list[dict], stock: pd.DataFrame,
-                      cfg: Config = CONFIG) -> None:
-    """Para cuántas semanas alcanza el stock de cada SKU.
+                      cfg: Config = CONFIG, factores: dict | None = None) -> None:
+    """Para cuántas semanas alcanza el stock de cada SKU, incluyendo la salida
+    por bonificado cuando hay factor.
 
     Es el mismo cálculo que hace la vista v_cobertura_actual; acá solo se
     reporta, para que la corrida avise de los productos en riesgo sin que
@@ -797,7 +991,8 @@ def resumen_cobertura(resultados: list[dict], stock: pd.DataFrame,
         d = por_sku.get(r.kopr)
         if not d or d <= 0:
             continue
-        filas.append((r.kopr, float(r.stock_fisico) / d))
+        f = ((factores or {}).get(r.kopr) or {}).get("factor") or 0.0
+        filas.append((r.kopr, float(r.stock_fisico) / (d * (1 + f))))
     if not filas:
         return
 
@@ -843,17 +1038,21 @@ def main(argv: list[str] | None = None) -> int:
         log.info("Leyendo ventas semanales de %s (sin stock)", args.csv)
         semanal = leer_ventas_csv(args.csv)
         semanal = semanal[semanal["kopr"].isin(cfg.skus)]
+        bonif_sem = None
+        log.info("Sin datos de bonificado en el modo --desde-csv: el factor queda NULL")
     else:
         log.info("Leyendo ventas de Softland (%d meses, %d SKUs)",
                  cfg.meses_historia, len(cfg.skus))
         with conectar_mssql() as cx:
-            diarias = leer_ventas_mssql(cx, cfg)
+            diarias, bonificado = leer_ventas_mssql(cx, cfg)
             productos = leer_productos_mssql(cx, cfg)
             stock = leer_stock_mssql(cx, cfg)
         log.info("  %d filas diarias, %d productos en el maestro, "
-                 "stock de %d SKUs en bodega %s",
-                 len(diarias), len(productos), len(stock), cfg.bodega)
+                 "stock de %d SKUs en bodega %s, %d filas de bonificado",
+                 len(diarias), len(productos), len(stock), cfg.bodega,
+                 len(bonificado))
         semanal = semanalizar(diarias)
+        bonif_sem = semanalizar_bonificado(bonificado)
 
     datos = completar_grilla(semanal, cfg)
     if datos.empty:
@@ -868,6 +1067,9 @@ def main(argv: list[str] | None = None) -> int:
     faltantes = sorted(set(cfg.skus) - set(datos["kopr"]))
     if faltantes:
         log.warning("Sin ventas en el período: %s", ", ".join(faltantes))
+
+    factores = calcular_factores_bonificacion(semanal, bonif_sem, ultima_semana_cerrada(), cfg)
+    advertir_factores(factores, cfg)
 
     # --- 2. Tratamiento ----------------------------------------------------
     if args.sin_tratamiento:
@@ -906,8 +1108,10 @@ def main(argv: list[str] | None = None) -> int:
 
     log.info("Modelados %d SKUs, fallidos %d (%.1fs)",
              len(resultados), len(fallidos), time.time() - t0)
+    for r in resultados:
+        r["metricas"]["factor_bonificacion"] = (factores.get(r["kopr"]) or {}).get("factor")
     resumen(resultados, cfg)
-    resumen_cobertura(resultados, stock, cfg)
+    resumen_cobertura(resultados, stock, cfg, factores)
 
     # --- 4. Persistencia ---------------------------------------------------
     if args.dry_run:
