@@ -1075,6 +1075,58 @@ def elegir_ancla(conn_pg, cfg: Config = CONFIG,
     return elegir_ancla_de(cierres_semanales(leer_capturas(conn_pg, cfg), cfg), cfg, ahora)
 
 
+def reconstruir_stock_historico(ancla: Ancla, movimientos: pd.DataFrame, cfg: Config,
+                                inicio: date) -> pd.DataFrame:
+    """Stock al cierre de cada semana, caminando hacia atrás desde la ancla.
+
+    stock(t) = stock(t+1) - flujo_neto(t+1). Pura: sin conexiones. Los negativos
+    se conservan (son la señal de calidad); los movimientos posteriores a la
+    ancla se descartan.
+    """
+    cols = ["kopr", "semana", "stock_fin", "flujo_neto"]
+    semanas = rango_semanas(inicio, ancla.semana)
+    skus = sorted(ancla.stock)
+    if movimientos is not None and not movimientos.empty:
+        sin_captura = sorted(set(movimientos["kopr"].astype(str)) - set(skus))
+        if sin_captura:
+            log.warning("%d SKU con movimientos y sin captura en la ancla, no se "
+                        "reconstruyen: %s", len(sin_captura), ", ".join(sin_captura[:20]))
+    if not skus or not semanas:
+        return pd.DataFrame(columns=cols)
+    grilla = pd.DataFrame([(k, s) for k in skus for s in semanas], columns=["kopr", "semana"])
+    if movimientos is not None and not movimientos.empty:
+        mov = movimientos[["kopr", "semana", "flujo_neto"]].copy()
+        mov["kopr"] = mov["kopr"].astype(str)
+        mov["semana"] = pd.to_datetime(mov["semana"]).dt.date
+        mov = mov.groupby(["kopr", "semana"], as_index=False)["flujo_neto"].sum()
+        grilla = grilla.merge(mov, on=["kopr", "semana"], how="left")
+    else:
+        grilla["flujo_neto"] = 0.0
+    grilla["flujo_neto"] = grilla["flujo_neto"].fillna(0.0).astype(float)
+    grilla = grilla.sort_values(["kopr", "semana"]).reset_index(drop=True)
+    # flujo posterior estricto = suma inversa acumulada - el propio flujo
+    inv = grilla.groupby("kopr")["flujo_neto"].transform(lambda s: s[::-1].cumsum()[::-1])
+    posterior = inv - grilla["flujo_neto"]
+    grilla["stock_fin"] = grilla["kopr"].map(ancla.stock).astype(float) - posterior
+    return grilla[cols]
+
+
+def calidad_stock_historico(df: pd.DataFrame) -> dict:
+    """Registra el control de calidad: las semanas con stock negativo."""
+    total = len(df)
+    neg = df[df["stock_fin"] < 0] if total else df
+    for kopr, g in neg.groupby("kopr"):
+        log.info("Stock negativo %s: %d semanas, peor %.2f, última %s",
+                 kopr, len(g), g["stock_fin"].min(), g["semana"].max())
+    pct = round(100.0 * len(neg) / total, 2) if total else 0.0
+    log.info("Stock histórico: %d de %d semanas-SKU negativas (%.2f%%; referencia 3.7%%)",
+             len(neg), total, pct)
+    if not 3.0 <= pct <= 5.0:
+        log.warning("Porcentaje de stock negativo %.2f%% fuera del rango esperado "
+                    "3%%-5%% (referencia 3.7%%)", pct)
+    return {"semanas": total, "negativas": len(neg), "pct": pct}
+
+
 def armar_filas_serie(tratado: pd.DataFrame, resultados: list[dict]) -> list[tuple]:
     """Convierte las tres series al formato de predictions.serie_semanal."""
     filas: list[tuple] = []

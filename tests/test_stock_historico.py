@@ -184,3 +184,89 @@ def test_elegir_ancla_lee_postgres():
     assert "bodega" in visto["sql"]
     assert cfg.bodega in tuple(visto["params"])
     assert a.stock == {"A": 100.0}
+
+
+# --- Reconstrucción hacia atrás y control de calidad -------------------------
+
+def _anc(semana, stock):
+    return bp.Ancla(semana=semana, capturado_en=datetime(2026, 10, 12, 0, 5, tzinfo=ZoneInfo(TZ)),
+                    antiguedad_dias=10, stock=stock)
+
+
+def _mov(filas):
+    return pd.DataFrame(filas, columns=["kopr", "semana", "flujo_neto"])
+
+
+def _rec(ancla, mov, inicio):
+    return bp.reconstruir_stock_historico(ancla, mov, Config(), inicio)
+
+
+def test_reconstruccion_camina_hacia_atras():
+    mov = _mov([("A", date(2026, 10, 5), 30.0), ("A", date(2026, 9, 28), -20.0)])
+    df = _rec(_anc(date(2026, 10, 5), {"A": 100.0}), mov, date(2026, 9, 21))
+    df = df.sort_values("semana").reset_index(drop=True)
+    assert list(df["semana"]) == [date(2026, 9, 21), date(2026, 9, 28), date(2026, 10, 5)]
+    assert list(df["stock_fin"]) == [90.0, 70.0, 100.0]
+    assert list(df["flujo_neto"]) == [0.0, -20.0, 30.0]
+
+
+def test_reconstruccion_grilla_completa_sin_hoyos():
+    mov = _mov([])
+    df = _rec(_anc(date(2026, 10, 5), {"A": 100.0}), mov, date(2026, 9, 7))
+    assert len(df) == 5
+    assert (df["flujo_neto"] == 0).all()
+    assert (df["stock_fin"] == 100).all()
+
+
+def test_reconstruccion_no_recorta_negativos():
+    mov = _mov([("A", date(2026, 10, 5), 50.0)])
+    df = _rec(_anc(date(2026, 10, 5), {"A": 10.0}), mov, date(2026, 9, 28))
+    previa = df[df["semana"] == date(2026, 9, 28)]["stock_fin"].iloc[0]
+    assert previa == -40.0
+
+
+def test_reconstruccion_omite_sku_sin_captura_y_avisa(caplog):
+    mov = _mov([("B", date(2026, 10, 5), 5.0)])
+    with caplog.at_level(logging.WARNING):
+        df = _rec(_anc(date(2026, 10, 5), {"A": 100.0}), mov, date(2026, 9, 28))
+    assert set(df["kopr"]) == {"A"}
+    assert "B" in caplog.text
+
+
+def test_reconstruccion_ignora_movimientos_posteriores_al_ancla():
+    base = _mov([("A", date(2026, 10, 5), 30.0)])
+    con = _mov([("A", date(2026, 10, 5), 30.0), ("A", date(2026, 10, 12), 999.0)])
+    a = _rec(_anc(date(2026, 10, 5), {"A": 100.0}), base, date(2026, 9, 28))
+    b = _rec(_anc(date(2026, 10, 5), {"A": 100.0}), con, date(2026, 9, 28))
+    pd.testing.assert_frame_equal(a.reset_index(drop=True), b.reset_index(drop=True))
+
+
+def _grilla_q(n_skus, n_sem, negativas):
+    filas = []
+    for s in range(n_skus):
+        for w in range(n_sem):
+            filas.append((f"S{s}", date(2026, 1, 5) + pd.Timedelta(weeks=w), 10.0))
+    df = pd.DataFrame(filas, columns=["kopr", "semana", "stock_fin"])
+    for i, v in negativas:
+        df.loc[i, "stock_fin"] = v
+    return df
+
+
+def test_calidad_cuenta_negativas(caplog):
+    df = _grilla_q(2, 10, [(3, -7.0)])
+    with caplog.at_level(logging.INFO):
+        r = bp.calidad_stock_historico(df)
+    assert r == {"semanas": 20, "negativas": 1, "pct": 5.0}
+    assert "S0" in caplog.text
+    assert "-7" in caplog.text
+    assert str(df.loc[3, "semana"]) in caplog.text
+
+
+def test_calidad_avisa_fuera_de_rango(caplog):
+    with caplog.at_level(logging.WARNING):
+        bp.calidad_stock_historico(_grilla_q(1, 10, []))
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        bp.calidad_stock_historico(_grilla_q(1, 25, [(0, -1.0)]))
+    assert not any(r.levelno == logging.WARNING for r in caplog.records)
