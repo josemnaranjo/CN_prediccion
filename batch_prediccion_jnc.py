@@ -42,8 +42,9 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
-from datetime import date, timedelta
+from dataclasses import dataclass, field, replace as dc_replace
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -107,6 +108,19 @@ class Config:
     bodega: str = "B01"              # bodega de despacho de JNC
     cobertura_aviso: float = 4.0     # semanas; bajo esto se avisa en el log
 
+    # --- Stock histórico ----------------------------------------------------
+    # Reconstrucción hacia atrás del stock semanal desde una captura ancla de
+    # stock_snapshot. Es un dato paralelo: no entra al modelo ni a las métricas.
+    # Con reconstruir_stock = False el job se comporta como antes.
+    reconstruir_stock: bool = True
+    dias_minimos_ancla: int = 10     # antigüedad mínima de la captura ancla
+    tido_entrada: tuple[str, ...] = ("FCC", "GRI", "GAR")      # suman stock
+    tido_salida: tuple[str, ...] = ("FCV", "FDV", "GDI")       # restan stock
+    tido_entrada_neg: tuple[str, ...] = ("NCC",)  # devolución de compra: resta
+    tido_salida_neg: tuple[str, ...] = ("NCV",)   # devolución de venta: suma
+    zona_horaria: str = "America/Santiago"  # para ubicar "lunes de madrugada"
+    hora_madrugada_max: int = 6      # capturas locales antes de esta hora cuentan como cierre
+
     # --- Operación ----------------------------------------------------------
     skus: tuple[str, ...] = SKUS_TESIS
     bloque_acumulado: int = 4        # tamaño del bloque para el MAPE acumulado
@@ -136,6 +150,18 @@ class Config:
             raise ValueError(
                 f"tido_bonificacion {self.tido_bonificacion} no puede incluir "
                 f"tipos de venta {TIPOS_VENTA}: se contaría doble")
+        grupos = {"tido_entrada": self.tido_entrada,
+                  "tido_salida": self.tido_salida,
+                  "tido_entrada_neg": self.tido_entrada_neg,
+                  "tido_salida_neg": self.tido_salida_neg}
+        nombres = list(grupos)
+        for i, a in enumerate(nombres):
+            for b_ in nombres[i + 1:]:
+                comunes = set(grupos[a]) & set(grupos[b_])
+                if comunes:
+                    raise ValueError(
+                        f"{a} y {b_} no pueden compartir tipos de documento "
+                        f"{sorted(comunes)}: el stock se contaría doble")
         p, d, q = self.orden_arima
         self.nombre_modelo = f"ARIMA({p},{d},{q})"
 
@@ -332,6 +358,59 @@ def leer_stock_mssql(conn, cfg: Config = CONFIG) -> pd.DataFrame:
     df["kopr"] = df["kopr"].astype(str).str.strip()
     df["bodega"] = df["bodega"].astype(str).str.strip()
     df["stock_fisico"] = df["stock_fisico"].astype(float).clip(lower=0)
+    return df
+
+
+def signos_tido(cfg: Config = CONFIG) -> dict[str, int]:
+    """Signo con que cada tipo de documento mueve el stock de la bodega.
+
+    Entradas y notas de venta (devuelven mercadería) suman; salidas y notas de
+    compra (devuelven al proveedor) restan.
+    """
+    signos = {t: 1 for t in cfg.tido_entrada + cfg.tido_salida_neg}
+    signos.update({t: -1 for t in cfg.tido_salida + cfg.tido_entrada_neg})
+    return signos
+
+
+def _query_movimientos(cfg: Config, desde: date, hasta_excl: date) -> str:
+    """Flujo neto semanal por SKU en la bodega, con el signo ya aplicado.
+
+    No se agrega a `_query_ventas`: esa consulta es la validada contra el
+    dataset de entrenamiento y la reconciliación del stock es unidad por
+    unidad, así que cada una conserva su propio filtro y su propio conjunto de
+    documentos. Aquí la bodega es DDO.BOSULIDO y la semana es el lunes de
+    FEEMDO (1900-01-01 fue lunes).
+    """
+    signos = signos_tido(cfg)
+    mas = _lista_sql([t for t, s in signos.items() if s > 0])
+    menos = _lista_sql([t for t, s in signos.items() if s < 0])
+    lunes = "DATEADD(DAY, -(DATEDIFF(DAY, '19000101', EDO.FEEMDO) % 7), CONVERT(DATE, EDO.FEEMDO))"
+    return f"""
+    SELECT
+      RTRIM(DDO.KOPRCT) AS kopr,
+      {lunes} AS semana,
+      SUM(CASE WHEN EDO.TIDO IN ({mas}) THEN DDO.CAPRCO1
+               WHEN EDO.TIDO IN ({menos}) THEN -DDO.CAPRCO1
+          END) AS flujo_neto
+    FROM dbo.MAEEDO AS EDO WITH (NOLOCK)
+    INNER JOIN dbo.MAEDDO AS DDO WITH (NOLOCK) ON EDO.IDMAEEDO = DDO.IDMAEEDO
+    WHERE EDO.TIDO IN ({_lista_sql(list(signos))})
+      AND DDO.BOSULIDO = '{cfg.bodega}'
+      AND RTRIM(DDO.KOPRCT) IN ({_lista_sql(cfg.skus)})
+      AND EDO.FEEMDO >= '{desde.strftime('%Y%m%d')}'
+      AND EDO.FEEMDO < '{hasta_excl.strftime('%Y%m%d')}'
+    GROUP BY RTRIM(DDO.KOPRCT), {lunes}
+    """
+
+
+def leer_movimientos_stock(conn, cfg: Config, desde: date,
+                           semana_ancla: date) -> pd.DataFrame:
+    """Flujo neto semanal por SKU desde `desde` hasta la semana ancla inclusive."""
+    hasta_excl = semana_ancla + timedelta(days=7)
+    df = pd.read_sql(_query_movimientos(cfg, desde, hasta_excl), conn)
+    df["kopr"] = df["kopr"].astype(str).str.strip()
+    df["semana"] = pd.to_datetime(df["semana"]).dt.date
+    df["flujo_neto"] = df["flujo_neto"].astype(float)
     return df
 
 
@@ -880,6 +959,23 @@ def guardar_stock(conn, batch_id: int, stock: pd.DataFrame) -> None:
     conn.commit()
 
 
+def guardar_stock_historico(conn, batch_id: int, bodega: str,
+                            serie: pd.DataFrame) -> None:
+    from psycopg2.extras import execute_values
+
+    if serie is None or serie.empty:
+        return
+    filas = [(batch_id, r.kopr, bodega, r.semana, round(float(r.stock_fin), 2),
+              round(float(r.flujo_neto), 2), r.origen) for r in serie.itertuples()]
+    with conn.cursor() as cur:
+        execute_values(cur, """
+            INSERT INTO predictions.stock_historico
+                (batch_run_id, kopr, bodega, semana, stock_fin, flujo_neto, origen)
+            VALUES %s
+        """, filas, page_size=1000)
+    conn.commit()
+
+
 def guardar_serie(conn, batch_id: int, filas: list[tuple]) -> None:
     from psycopg2.extras import execute_values
 
@@ -919,6 +1015,170 @@ def guardar_metricas(conn, batch_id: int, metricas: list[dict]) -> None:
             VALUES %s
         """, filas)
     conn.commit()
+
+
+# ============================================================================
+# Inventario histórico: cierres semanales y ancla
+# ============================================================================
+# Una captura tomada a las 00:0x del día D refleja el cierre del día D-1. Por
+# eso la captura que cierra una semana ISO es la del lunes de madrugada. El
+# cierre se calcula a partir de la hora local, nunca se asume.
+
+@dataclass(frozen=True)
+class Ancla:
+    semana: date              # lunes de la semana que la captura cierra
+    capturado_en: datetime
+    antiguedad_dias: int
+    stock: dict               # kopr -> stock al cierre
+
+
+def cierres_semanales(capturas: pd.DataFrame, cfg: Config = CONFIG) -> pd.DataFrame:
+    """Una fila (kopr, semana, stock_fin, capturado_en) por cierre semanal real."""
+    cols = ["kopr", "semana", "stock_fin", "capturado_en"]
+    if capturas is None or capturas.empty:
+        return pd.DataFrame(columns=cols)
+    df = capturas.copy()
+    local = pd.to_datetime(df["capturado_en"], utc=True).dt.tz_convert(cfg.zona_horaria)
+    df["capturado_en"] = local
+    df["_fecha"] = local.dt.date
+    df = df[(local.dt.weekday == 0) & (local.dt.hour < cfg.hora_madrugada_max)]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    df = df.sort_values("capturado_en").drop_duplicates(["kopr", "_fecha"], keep="first")
+    df["semana"] = df["_fecha"].map(lambda f: f - timedelta(days=7))
+    df = df.rename(columns={"stock_fisico": "stock_fin"})
+    return df[cols].reset_index(drop=True)
+
+
+def elegir_ancla_de(cierres: pd.DataFrame, cfg: Config,
+                    ahora: datetime) -> Ancla | None:
+    """Cierre más reciente con al menos `dias_minimos_ancla` de antigüedad."""
+    if cierres is None or cierres.empty:
+        log.info("Sin cierres semanales en stock_snapshot: no se reconstruye "
+                 "stock histórico")
+        return None
+    limite = ahora - timedelta(days=cfg.dias_minimos_ancla)
+    elegibles = cierres[cierres["capturado_en"] <= limite]
+    if elegibles.empty:
+        log.info("Ningún cierre semanal tiene %d días de antigüedad: no se "
+                 "reconstruye stock histórico", cfg.dias_minimos_ancla)
+        return None
+    semana = max(elegibles["semana"])
+    filas = elegibles[elegibles["semana"] == semana]
+    capturado = filas["capturado_en"].max().to_pydatetime()
+    antiguedad = (ahora - capturado).days
+    log.info("Ancla de stock: semana %s, capturada %s, antigüedad %d días",
+             semana, capturado.isoformat(), antiguedad)
+    return Ancla(semana=semana, capturado_en=capturado, antiguedad_dias=antiguedad,
+                 stock={str(k): float(v) for k, v in zip(filas["kopr"], filas["stock_fin"])})
+
+
+def leer_capturas(conn_pg, cfg: Config = CONFIG) -> pd.DataFrame:
+    with conn_pg.cursor() as cur:
+        cur.execute("""
+            SELECT kopr, stock_fisico, capturado_en
+            FROM predictions.stock_snapshot
+            WHERE bodega = %s
+        """, (cfg.bodega,))
+        filas = cur.fetchall()
+    df = pd.DataFrame(filas, columns=["kopr", "stock_fisico", "capturado_en"])
+    df["stock_fisico"] = df["stock_fisico"].astype(float)
+    return df
+
+
+def elegir_ancla(conn_pg, cfg: Config = CONFIG,
+                 ahora: datetime | None = None) -> Ancla | None:
+    ahora = ahora or datetime.now(ZoneInfo(cfg.zona_horaria))
+    return elegir_ancla_de(cierres_semanales(leer_capturas(conn_pg, cfg), cfg), cfg, ahora)
+
+
+def reconstruir_stock_historico(ancla: Ancla, movimientos: pd.DataFrame, cfg: Config,
+                                inicio: date) -> pd.DataFrame:
+    """Stock al cierre de cada semana, caminando hacia atrás desde la ancla.
+
+    stock(t) = stock(t+1) - flujo_neto(t+1). Pura: sin conexiones. Los negativos
+    se conservan (son la señal de calidad); los movimientos posteriores a la
+    ancla se descartan.
+    """
+    cols = ["kopr", "semana", "stock_fin", "flujo_neto"]
+    semanas = rango_semanas(inicio, ancla.semana)
+    skus = sorted(ancla.stock)
+    if movimientos is not None and not movimientos.empty:
+        sin_captura = sorted(set(movimientos["kopr"].astype(str)) - set(skus))
+        if sin_captura:
+            log.warning("%d SKU con movimientos y sin captura en la ancla, no se "
+                        "reconstruyen: %s", len(sin_captura), ", ".join(sin_captura[:20]))
+    if not skus or not semanas:
+        return pd.DataFrame(columns=cols)
+    grilla = pd.DataFrame([(k, s) for k in skus for s in semanas], columns=["kopr", "semana"])
+    if movimientos is not None and not movimientos.empty:
+        mov = movimientos[["kopr", "semana", "flujo_neto"]].copy()
+        mov["kopr"] = mov["kopr"].astype(str)
+        mov["semana"] = pd.to_datetime(mov["semana"]).dt.date
+        mov = mov.groupby(["kopr", "semana"], as_index=False)["flujo_neto"].sum()
+        grilla = grilla.merge(mov, on=["kopr", "semana"], how="left")
+    else:
+        grilla["flujo_neto"] = 0.0
+    grilla["flujo_neto"] = grilla["flujo_neto"].fillna(0.0).astype(float)
+    grilla = grilla.sort_values(["kopr", "semana"]).reset_index(drop=True)
+    # flujo posterior estricto = suma inversa acumulada - el propio flujo
+    inv = grilla.groupby("kopr")["flujo_neto"].transform(lambda s: s[::-1].cumsum()[::-1])
+    posterior = inv - grilla["flujo_neto"]
+    grilla["stock_fin"] = grilla["kopr"].map(ancla.stock).astype(float) - posterior
+    return grilla[cols]
+
+
+def armar_serie_historica(reconstruido: pd.DataFrame, cierres: pd.DataFrame,
+                          ancla: Ancla) -> pd.DataFrame:
+    """Serie final (kopr, semana, stock_fin, flujo_neto, origen) ordenada.
+
+    La ancla y las semanas posteriores con cierre real son 'capturado'; las
+    anteriores a la ancla, 'reconstruido' aun si existe una captura real. El
+    flujo de una semana posterior es la diferencia contra el stock_fin de la
+    semana previa de la serie (0 si esa semana no está).
+    """
+    cols = ["kopr", "semana", "stock_fin", "flujo_neto", "origen"]
+    partes = []
+    if reconstruido is not None and not reconstruido.empty:
+        rec = reconstruido[["kopr", "semana", "stock_fin", "flujo_neto"]].copy()
+        rec["kopr"] = rec["kopr"].astype(str)
+        es_ancla = rec["semana"] == ancla.semana
+        rec.loc[es_ancla, "stock_fin"] = rec.loc[es_ancla, "kopr"].map(ancla.stock)
+        rec["origen"] = ["capturado" if a else "reconstruido" for a in es_ancla]
+        partes.append(rec[rec["semana"] <= ancla.semana])
+    base = pd.concat(partes, ignore_index=True) if partes else pd.DataFrame(columns=cols)
+    previo = {(k, s): v for k, s, v in zip(base["kopr"], base["semana"], base["stock_fin"])}
+    nuevas = []
+    if cierres is not None and not cierres.empty:
+        post = cierres[cierres["semana"] > ancla.semana].copy()
+        post["kopr"] = post["kopr"].astype(str)
+        post = post.sort_values(["kopr", "semana"]).drop_duplicates(["kopr", "semana"],
+                                                                    keep="last")
+        for r in post.itertuples():
+            stock = float(r.stock_fin)
+            ant = previo.get((r.kopr, r.semana - timedelta(days=7)))
+            flujo = 0.0 if ant is None else stock - float(ant)
+            previo[(r.kopr, r.semana)] = stock
+            nuevas.append((r.kopr, r.semana, stock, flujo, "capturado"))
+    if nuevas:
+        base = pd.concat([base, pd.DataFrame(nuevas, columns=cols)], ignore_index=True)
+    return base[cols].sort_values(["kopr", "semana"]).reset_index(drop=True)
+
+
+def calidad_stock_historico(df: pd.DataFrame) -> dict:
+    """Registra el control de calidad: las semanas con stock negativo."""
+    total = len(df)
+    neg = df[df["stock_fin"] < 0] if total else df
+    for kopr, g in neg.groupby("kopr"):
+        log.info("Stock negativo %s: %d semanas, peor %.2f, última %s",
+                 kopr, len(g), g["stock_fin"].min(), g["semana"].max())
+    pct = round(100.0 * len(neg) / total, 2) if total else 0.0
+    log.info("Stock histórico: %d de %d semanas-SKU negativas (%.2f%%; referencia 3.7%%)",
+             len(neg), total, pct)
+    if not 3.0 <= pct <= 5.0:
+        log.warning("Porcentaje de stock negativo %.2f%% fuera del rango esperado "
+                    "3%%-5%% (referencia 3.7%%)", pct)
+    return {"semanas": total, "negativas": len(neg), "pct": pct}
 
 
 def armar_filas_serie(tratado: pd.DataFrame, resultados: list[dict]) -> list[tuple]:
@@ -1003,6 +1263,26 @@ def resumen_cobertura(resultados: list[dict], stock: pd.DataFrame,
     if criticos:
         log.warning("  Bajo %.0f semanas de cobertura: %s", cfg.cobertura_aviso,
                     ", ".join(f"{k} ({c:.1f})" for k, c in criticos))
+
+
+def generar_stock_historico(conn_pg, batch_id: int, inicio: date, cfg: Config) -> int:
+    """Reconstruye y guarda la serie histórica de stock. Devuelve las filas guardadas."""
+    ancla = elegir_ancla(conn_pg, cfg)
+    if ancla is None:
+        log.warning("Stock histórico: no hay captura de cierre utilizable; se omite")
+        return 0
+    conn_pg.rollback()  # cierra la transacción de lectura antes de ir a Softland
+    skus = set(cfg.skus)
+    ancla = dc_replace(ancla, stock={k: v for k, v in ancla.stock.items() if k in skus})
+    with conectar_mssql() as cx:
+        movimientos = leer_movimientos_stock(cx, cfg, inicio, ancla.semana)
+    reconstruido = reconstruir_stock_historico(ancla, movimientos, cfg, inicio)
+    calidad_stock_historico(reconstruido)
+    cierres = cierres_semanales(leer_capturas(conn_pg, cfg), cfg)
+    serie = armar_serie_historica(reconstruido, cierres, ancla)
+    guardar_stock_historico(conn_pg, batch_id, cfg.bodega, serie)
+    log.info("Stock histórico: %d filas guardadas (ancla %s)", len(serie), ancla.semana)
+    return len(serie)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1128,6 +1408,20 @@ def main(argv: list[str] | None = None) -> int:
         guardar_serie(conn, batch_id, armar_filas_serie(datos, resultados))
         guardar_metricas(conn, batch_id, [r["metricas"] | {"kopr": r["kopr"]}
                                           for r in resultados])
+        if cfg.reconstruir_stock and args.csv:
+            log.info("Stock histórico omitido: --desde-csv no tiene conexión a Softland")
+        elif cfg.reconstruir_stock:
+            try:
+                generar_stock_historico(conn, batch_id, inicio, cfg)
+            except Exception:  # noqa: BLE001 — el histórico no debe tumbar la corrida
+                log.exception("Stock histórico falló; la corrida %d sigue como ok", batch_id)
+                try:  # una transacción abortada rompería cerrar_corrida
+                    conn.rollback()
+                except Exception:  # noqa: BLE001
+                    log.exception("rollback falló tras el error del stock histórico")
+                if getattr(conn, "closed", 0):
+                    log.warning("Conexión PostgreSQL cerrada; se reconecta para cerrar la corrida")
+                    conn = conectar_postgres()
         cerrar_corrida(conn, batch_id, "ok", len(resultados), len(fallidos),
                        time.time() - t0)
         log.info("Corrida %d guardada.", batch_id)
