@@ -361,3 +361,160 @@ def test_guardar_stock_historico_vacio_no_hace_nada(monkeypatch):
     bp.guardar_stock_historico(conn, 7, "B01", pd.DataFrame(
         columns=["kopr", "semana", "stock_fin", "flujo_neto", "origen"]))
     assert llamadas == [] and conn.commits == 0
+
+
+# --- Task 6: orquestación -------------------------------------------------------
+
+class _Cx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _ancla():
+    return bp.Ancla(semana=date(2026, 10, 12), capturado_en=None,
+                    antiguedad_dias=1, stock={"A": 5.0})
+
+
+def test_generar_sin_ancla_no_guarda_y_no_falla(monkeypatch):
+    llamadas = []
+    monkeypatch.setattr(bp, "elegir_ancla", lambda conn, cfg: None)
+    monkeypatch.setattr(bp, "conectar_mssql", lambda: llamadas.append("mssql") or _Cx())
+    monkeypatch.setattr(bp, "leer_movimientos_stock",
+                        lambda *a, **k: llamadas.append("mov"))
+    monkeypatch.setattr(bp, "guardar_stock_historico",
+                        lambda *a, **k: llamadas.append("guardar"))
+    assert bp.generar_stock_historico(object(), 7, date(2025, 1, 6), Config()) == 0
+    assert llamadas == []
+
+
+def test_generar_encadena_los_pasos(monkeypatch):
+    cfg = Config()
+    ancla = _ancla()
+    inicio = date(2025, 1, 6)
+    visto = {}
+    serie = pd.DataFrame({"kopr": ["A", "A"], "semana": [date(2026, 10, 5), ancla.semana],
+                          "stock_fin": [4.0, 5.0], "flujo_neto": [0.0, 1.0],
+                          "origen": ["reconstruido", "capturado"]})
+    monkeypatch.setattr(bp, "elegir_ancla", lambda conn, c: ancla)
+    monkeypatch.setattr(bp, "conectar_mssql", lambda: _Cx())
+
+    def mov(conn, c, desde, semana_ancla):
+        visto["mov"] = (desde, semana_ancla)
+        return "MOV"
+    monkeypatch.setattr(bp, "leer_movimientos_stock", mov)
+    monkeypatch.setattr(bp, "reconstruir_stock_historico",
+                        lambda a, m, c, ini: visto.update(rec=(a, m, ini)) or "REC")
+    monkeypatch.setattr(bp, "calidad_stock_historico", lambda df: visto.update(cal=df))
+    monkeypatch.setattr(bp, "leer_capturas", lambda conn, c: "CAP")
+    monkeypatch.setattr(bp, "cierres_semanales", lambda cap, c: "CIE")
+    monkeypatch.setattr(bp, "armar_serie_historica",
+                        lambda rec, cie, a: visto.update(arm=(rec, cie, a)) or serie)
+    monkeypatch.setattr(bp, "guardar_stock_historico",
+                        lambda conn, bid, bod, s: visto.update(gua=(bid, bod, s)))
+
+    assert bp.generar_stock_historico(object(), 42, inicio, cfg) == 2
+    assert visto["mov"] == (inicio, ancla.semana)
+    assert visto["rec"] == (ancla, "MOV", inicio)
+    assert visto["cal"] == "REC"
+    assert visto["arm"] == ("REC", "CIE", ancla)
+    assert visto["gua"][0] == 42 and visto["gua"][1] == cfg.bodega
+    assert visto["gua"][2] is serie
+
+
+class _Conn:
+    def __init__(self, eventos):
+        self.eventos = eventos
+
+    def rollback(self):
+        self.eventos.append("rollback")
+
+    def close(self):
+        self.eventos.append("close")
+
+
+@pytest.fixture
+def corrida(monkeypatch):
+    """Corre main([...]) completo con dobles; devuelve el registro de eventos."""
+    eventos = []
+    datos = pd.DataFrame({"kopr": ["A", "A"],
+                          "semana": [date(2025, 1, 6), date(2025, 1, 13)],
+                          "demanda": [1.0, 2.0]})
+    cfg = Config(reconstruir_stock=True)
+    monkeypatch.setattr(bp, "CONFIG", cfg)
+    monkeypatch.setattr(bp, "cargar_env_local", lambda: None)
+    monkeypatch.setattr(bp, "conectar_mssql", lambda: _Cx())
+    monkeypatch.setattr(bp, "leer_ventas_mssql",
+                        lambda cx, c: (pd.DataFrame(), pd.DataFrame()))
+    monkeypatch.setattr(bp, "leer_productos_mssql", lambda cx, c: pd.DataFrame())
+    monkeypatch.setattr(bp, "leer_stock_mssql", lambda cx, c: pd.DataFrame())
+    monkeypatch.setattr(bp, "leer_ventas_csv", lambda p: pd.DataFrame({"kopr": ["A"]}))
+    monkeypatch.setattr(bp, "semanalizar", lambda d: d)
+    monkeypatch.setattr(bp, "semanalizar_bonificado", lambda b: None)
+    monkeypatch.setattr(bp, "completar_grilla", lambda s, c: datos.copy())
+    monkeypatch.setattr(bp, "calcular_factores_bonificacion", lambda *a, **k: {})
+    monkeypatch.setattr(bp, "advertir_factores", lambda *a, **k: None)
+    monkeypatch.setattr(bp, "winsorizar",
+                        lambda d, c: d.assign(demanda_cruda=d["demanda"], fue_tratada=False))
+    monkeypatch.setattr(bp, "marcar_censuradas", lambda d, c: d.assign(censurada=False))
+    monkeypatch.setattr(bp, "procesar_sku", lambda k, g, c: {
+        "kopr": k, "metricas": {"mape_semanal": 1.0, "mape_4sem": 1.0},
+        "proyeccion": None})
+    monkeypatch.setattr(bp, "resumen", lambda *a, **k: None)
+    monkeypatch.setattr(bp, "resumen_cobertura", lambda *a, **k: None)
+    monkeypatch.setattr(bp, "armar_filas_serie", lambda d, r: [])
+    monkeypatch.setattr(bp, "conectar_postgres", lambda: _Conn(eventos))
+    monkeypatch.setattr(bp, "abrir_corrida", lambda *a, **k: 99)
+    monkeypatch.setattr(bp, "guardar_productos", lambda *a, **k: None)
+    monkeypatch.setattr(bp, "guardar_stock", lambda *a, **k: None)
+    monkeypatch.setattr(bp, "guardar_serie", lambda *a, **k: None)
+    monkeypatch.setattr(bp, "guardar_metricas", lambda *a, **k: eventos.append("metricas"))
+    monkeypatch.setattr(bp, "cerrar_corrida",
+                        lambda conn, bid, estado, *a, **k: eventos.append(("cerrar", estado)))
+    monkeypatch.setattr(bp, "generar_stock_historico",
+                        lambda conn, bid, ini, c: eventos.append(("historico", bid, ini)) or 3)
+    return eventos, cfg
+
+
+def test_main_con_reconstruir_stock_false_no_llama_nada(corrida):
+    eventos, cfg = corrida
+    cfg.reconstruir_stock = False
+    assert bp.main([]) == 0
+    assert not any(isinstance(e, tuple) and e[0] == "historico" for e in eventos)
+    assert ("cerrar", "ok") in eventos
+
+
+def test_main_reconstruye_entre_metricas_y_cierre(corrida):
+    eventos, _ = corrida
+    assert bp.main([]) == 0
+    assert eventos.index("metricas") < eventos.index(("historico", 99, date(2025, 1, 6))) \
+        < eventos.index(("cerrar", "ok"))
+
+
+def test_main_excepcion_en_historico_no_cambia_el_estado(corrida, monkeypatch):
+    eventos, _ = corrida
+
+    def falla(*a, **k):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(bp, "generar_stock_historico", falla)
+    assert bp.main([]) == 0
+    assert ("cerrar", "ok") in eventos
+    assert ("cerrar", "error") not in eventos
+    assert eventos.index("rollback") < eventos.index(("cerrar", "ok"))
+
+
+def test_main_desde_csv_no_reconstruye(corrida, caplog):
+    eventos, _ = corrida
+    with caplog.at_level("INFO"):
+        assert bp.main(["--desde-csv", "x.csv"]) == 0
+    assert not any(isinstance(e, tuple) and e[0] == "historico" for e in eventos)
+    assert "Softland" in caplog.text
+    assert ("cerrar", "ok") in eventos
+
+
+def test_main_dry_run_no_reconstruye(corrida):
+    eventos, _ = corrida
+    assert bp.main(["--dry-run"]) == 0
+    assert eventos == []

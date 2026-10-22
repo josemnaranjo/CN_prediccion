@@ -1265,6 +1265,23 @@ def resumen_cobertura(resultados: list[dict], stock: pd.DataFrame,
                     ", ".join(f"{k} ({c:.1f})" for k, c in criticos))
 
 
+def generar_stock_historico(conn_pg, batch_id: int, inicio: date, cfg: Config) -> int:
+    """Reconstruye y guarda la serie histórica de stock. Devuelve las filas guardadas."""
+    ancla = elegir_ancla(conn_pg, cfg)
+    if ancla is None:
+        log.warning("Stock histórico: no hay captura de cierre utilizable; se omite")
+        return 0
+    with conectar_mssql() as cx:
+        movimientos = leer_movimientos_stock(cx, cfg, inicio, ancla.semana)
+    reconstruido = reconstruir_stock_historico(ancla, movimientos, cfg, inicio)
+    calidad_stock_historico(reconstruido)
+    cierres = cierres_semanales(leer_capturas(conn_pg, cfg), cfg)
+    serie = armar_serie_historica(reconstruido, cierres, ancla)
+    guardar_stock_historico(conn_pg, batch_id, cfg.bodega, serie)
+    log.info("Stock histórico: %d filas guardadas (ancla %s)", len(serie), ancla.semana)
+    return len(serie)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Batch de pronóstico de demanda JNC")
     ap.add_argument("--dry-run", action="store_true",
@@ -1388,6 +1405,14 @@ def main(argv: list[str] | None = None) -> int:
         guardar_serie(conn, batch_id, armar_filas_serie(datos, resultados))
         guardar_metricas(conn, batch_id, [r["metricas"] | {"kopr": r["kopr"]}
                                           for r in resultados])
+        if cfg.reconstruir_stock and args.csv:
+            log.info("Stock histórico omitido: --desde-csv no tiene conexión a Softland")
+        elif cfg.reconstruir_stock:
+            try:
+                generar_stock_historico(conn, batch_id, inicio, cfg)
+            except Exception:  # noqa: BLE001 — el histórico no debe tumbar la corrida
+                log.exception("Stock histórico falló; la corrida %d sigue como ok", batch_id)
+                conn.rollback()  # una transacción abortada rompería cerrar_corrida
         cerrar_corrida(conn, batch_id, "ok", len(resultados), len(fallidos),
                        time.time() - t0)
         log.info("Corrida %d guardada.", batch_id)
