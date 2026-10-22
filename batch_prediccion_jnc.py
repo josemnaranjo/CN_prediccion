@@ -959,6 +959,23 @@ def guardar_stock(conn, batch_id: int, stock: pd.DataFrame) -> None:
     conn.commit()
 
 
+def guardar_stock_historico(conn, batch_id: int, bodega: str,
+                            serie: pd.DataFrame) -> None:
+    from psycopg2.extras import execute_values
+
+    if serie is None or serie.empty:
+        return
+    filas = [(batch_id, r.kopr, bodega, r.semana, round(float(r.stock_fin), 2),
+              round(float(r.flujo_neto), 2), r.origen) for r in serie.itertuples()]
+    with conn.cursor() as cur:
+        execute_values(cur, """
+            INSERT INTO predictions.stock_historico
+                (batch_run_id, kopr, bodega, semana, stock_fin, flujo_neto, origen)
+            VALUES %s
+        """, filas, page_size=1000)
+    conn.commit()
+
+
 def guardar_serie(conn, batch_id: int, filas: list[tuple]) -> None:
     from psycopg2.extras import execute_values
 
@@ -1109,6 +1126,43 @@ def reconstruir_stock_historico(ancla: Ancla, movimientos: pd.DataFrame, cfg: Co
     posterior = inv - grilla["flujo_neto"]
     grilla["stock_fin"] = grilla["kopr"].map(ancla.stock).astype(float) - posterior
     return grilla[cols]
+
+
+def armar_serie_historica(reconstruido: pd.DataFrame, cierres: pd.DataFrame,
+                          ancla: Ancla) -> pd.DataFrame:
+    """Serie final (kopr, semana, stock_fin, flujo_neto, origen) ordenada.
+
+    La ancla y las semanas posteriores con cierre real son 'capturado'; las
+    anteriores a la ancla, 'reconstruido' aun si existe una captura real. El
+    flujo de una semana posterior es la diferencia contra el stock_fin de la
+    semana previa de la serie (0 si esa semana no está).
+    """
+    cols = ["kopr", "semana", "stock_fin", "flujo_neto", "origen"]
+    partes = []
+    if reconstruido is not None and not reconstruido.empty:
+        rec = reconstruido[["kopr", "semana", "stock_fin", "flujo_neto"]].copy()
+        rec["kopr"] = rec["kopr"].astype(str)
+        es_ancla = rec["semana"] == ancla.semana
+        rec.loc[es_ancla, "stock_fin"] = rec.loc[es_ancla, "kopr"].map(ancla.stock)
+        rec["origen"] = ["capturado" if a else "reconstruido" for a in es_ancla]
+        partes.append(rec[rec["semana"] <= ancla.semana])
+    base = pd.concat(partes, ignore_index=True) if partes else pd.DataFrame(columns=cols)
+    previo = {(k, s): v for k, s, v in zip(base["kopr"], base["semana"], base["stock_fin"])}
+    nuevas = []
+    if cierres is not None and not cierres.empty:
+        post = cierres[cierres["semana"] > ancla.semana].copy()
+        post["kopr"] = post["kopr"].astype(str)
+        post = post.sort_values(["kopr", "semana"]).drop_duplicates(["kopr", "semana"],
+                                                                    keep="last")
+        for r in post.itertuples():
+            stock = float(r.stock_fin)
+            ant = previo.get((r.kopr, r.semana - timedelta(days=7)))
+            flujo = 0.0 if ant is None else stock - float(ant)
+            previo[(r.kopr, r.semana)] = stock
+            nuevas.append((r.kopr, r.semana, stock, flujo, "capturado"))
+    if nuevas:
+        base = pd.concat([base, pd.DataFrame(nuevas, columns=cols)], ignore_index=True)
+    return base[cols].sort_values(["kopr", "semana"]).reset_index(drop=True)
 
 
 def calidad_stock_historico(df: pd.DataFrame) -> dict:

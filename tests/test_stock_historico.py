@@ -270,3 +270,94 @@ def test_calidad_avisa_fuera_de_rango(caplog):
     with caplog.at_level(logging.WARNING):
         bp.calidad_stock_historico(_grilla_q(1, 25, [(0, -1.0)]))
     assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+# --- Task 5: armado y persistencia de la serie ---------------------------------
+
+def _recon_3sem():
+    return pd.DataFrame({"kopr": ["A"] * 3,
+                         "semana": [date(2026, 9, 21), date(2026, 9, 28), date(2026, 10, 5)],
+                         "stock_fin": [70.0, 90.0, 100.0],
+                         "flujo_neto": [5.0, 20.0, 10.0]})
+
+
+def _cie(filas):
+    return pd.DataFrame([{"kopr": k, "semana": s, "stock_fin": v,
+                          "capturado_en": pd.Timestamp("2026-10-20", tz="UTC")}
+                         for k, s, v in filas])
+
+
+def _serie(cierres_filas, recon=None):
+    return bp.armar_serie_historica(_recon_3sem() if recon is None else recon,
+                                    _cie(cierres_filas), _anc(date(2026, 10, 5), {"A": 100.0}))
+
+
+def test_armar_serie_marca_origen():
+    s = _serie([("A", date(2026, 10, 12), 130.0), ("A", date(2026, 10, 19), 125.0)])
+    assert list(s["origen"]) == ["reconstruido", "reconstruido", "capturado",
+                                 "capturado", "capturado"]
+    assert s.loc[s["semana"] == date(2026, 10, 5), "stock_fin"].iloc[0] == 100.0
+    assert s.loc[s["semana"] == date(2026, 10, 5), "flujo_neto"].iloc[0] == 10.0
+
+
+def test_armar_serie_flujo_de_capturadas_es_la_diferencia():
+    s = _serie([("A", date(2026, 10, 12), 130.0), ("A", date(2026, 10, 19), 125.0)])
+    assert list(s["flujo_neto"].iloc[-2:]) == [30.0, -5.0]
+
+
+def test_armar_serie_cierre_sin_semana_previa_flujo_cero():
+    s = _serie([("A", date(2026, 10, 26), 140.0)])
+    assert s.iloc[-1]["flujo_neto"] == 0
+
+
+def test_armar_serie_sin_semanas_repetidas_ni_cierres_previos():
+    s = _serie([("A", date(2026, 10, 5), 999.0), ("A", date(2026, 9, 28), 999.0),
+                ("A", date(2026, 10, 12), 130.0)])
+    assert not s.duplicated(["kopr", "semana"]).any()
+    assert len(s) == 4
+    assert 999.0 not in set(s["stock_fin"])
+    assert s[s["semana"] == date(2026, 9, 28)]["origen"].iloc[0] == "reconstruido"
+
+
+def test_armar_serie_todas_las_semanas_son_lunes():
+    s = _serie([("A", date(2026, 10, 12), 130.0)])
+    assert all(x.weekday() == 0 for x in s["semana"])
+
+
+class _CurFake:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+class _ConnFake:
+    def __init__(self): self.commits = 0
+    def cursor(self): return _CurFake()
+    def commit(self): self.commits += 1
+
+
+def test_guardar_stock_historico(monkeypatch):
+    llamadas = []
+    import psycopg2.extras
+    monkeypatch.setattr(psycopg2.extras, "execute_values",
+                        lambda cur, sql, filas, **k: llamadas.append((sql, filas, k)))
+    serie = pd.DataFrame({"kopr": ["A"], "semana": [date(2026, 10, 5)],
+                          "stock_fin": [100.12345], "flujo_neto": [-5.5555],
+                          "origen": ["capturado"]})
+    conn = _ConnFake()
+    bp.guardar_stock_historico(conn, 7, "B01", serie)
+    sql, filas, k = llamadas[0]
+    assert "predictions.stock_historico" in sql
+    assert filas == [(7, "A", "B01", date(2026, 10, 5), 100.12, -5.56, "capturado")]
+    assert k["page_size"] == 1000
+    assert conn.commits == 1
+
+
+def test_guardar_stock_historico_vacio_no_hace_nada(monkeypatch):
+    llamadas = []
+    import psycopg2.extras
+    monkeypatch.setattr(psycopg2.extras, "execute_values",
+                        lambda *a, **k: llamadas.append(1))
+    conn = _ConnFake()
+    bp.guardar_stock_historico(conn, 7, "B01", pd.DataFrame(
+        columns=["kopr", "semana", "stock_fin", "flujo_neto", "origen"]))
+    assert llamadas == [] and conn.commits == 0
