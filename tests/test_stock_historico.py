@@ -347,7 +347,8 @@ def test_guardar_stock_historico(monkeypatch):
     bp.guardar_stock_historico(conn, 7, "B01", serie)
     sql, filas, k = llamadas[0]
     assert "predictions.stock_historico" in sql
-    assert filas == [(7, "A", "B01", date(2026, 10, 5), 100.12, -5.56, "capturado")]
+    assert filas == [(7, "A", "B01", date(2026, 10, 5), 100.12, -5.56, "capturado",
+                      None, None)]
     assert k["page_size"] == 1000
     assert conn.commits == 1
 
@@ -408,6 +409,9 @@ def test_generar_encadena_los_pasos(monkeypatch):
                           "origen": ["reconstruido", "capturado"]})
     monkeypatch.setattr(bp, "elegir_ancla", lambda conn, c: ancla)
     monkeypatch.setattr(bp, "conectar_mssql", lambda: _Cx())
+    cerrada = date(2026, 10, 26)
+    monkeypatch.setattr(bp, "ultima_semana_cerrada", lambda *a, **k: cerrada)
+    monkeypatch.setattr(bp, "agregar_compras_salidas", lambda s, m, h: s)
 
     def mov(conn, c, desde, semana_ancla):
         visto["mov"] = (desde, semana_ancla)
@@ -424,7 +428,7 @@ def test_generar_encadena_los_pasos(monkeypatch):
                         lambda conn, bid, bod, s: visto.update(gua=(bid, bod, s)))
 
     assert bp.generar_stock_historico(_Pg(), 42, inicio, cfg) == 2
-    assert visto["mov"] == (inicio, ancla.semana)
+    assert visto["mov"] == (inicio, max(ancla.semana, cerrada))
     assert visto["rec"] == (ancla, "MOV", inicio)
     assert visto["cal"] == "REC"
     assert visto["arm"] == ("REC", "CIE", ancla)

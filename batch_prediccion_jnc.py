@@ -118,6 +118,10 @@ class Config:
     tido_salida: tuple[str, ...] = ("FCV", "FDV", "GDI")       # restan stock
     tido_entrada_neg: tuple[str, ...] = ("NCC",)  # devolución de compra: resta
     tido_salida_neg: tuple[str, ...] = ("NCV",)   # devolución de venta: suma
+    # Recepciones del proveedor para el panel de compras: subconjunto de las
+    # entradas (GRI y GAR no son compras).
+    tido_compra: tuple[str, ...] = ("FCC",)
+    tido_compra_neg: tuple[str, ...] = ("NCC",)
     zona_horaria: str = "America/Santiago"  # para ubicar "lunes de madrugada"
     hora_madrugada_max: int = 6      # capturas locales antes de esta hora cuentan como cierre
 
@@ -162,6 +166,12 @@ class Config:
                     raise ValueError(
                         f"{a} y {b_} no pueden compartir tipos de documento "
                         f"{sorted(comunes)}: el stock se contaría doble")
+        if not set(self.tido_compra) <= set(self.tido_entrada):
+            raise ValueError(f"tido_compra {self.tido_compra} debe ser subconjunto "
+                             f"de tido_entrada {self.tido_entrada}")
+        if not set(self.tido_compra_neg) <= set(self.tido_entrada_neg):
+            raise ValueError(f"tido_compra_neg {self.tido_compra_neg} debe ser "
+                             f"subconjunto de tido_entrada_neg {self.tido_entrada_neg}")
         p, d, q = self.orden_arima
         self.nombre_modelo = f"ARIMA({p},{d},{q})"
 
@@ -391,7 +401,13 @@ def _query_movimientos(cfg: Config, desde: date, hasta_excl: date) -> str:
       {lunes} AS semana,
       SUM(CASE WHEN EDO.TIDO IN ({mas}) THEN DDO.CAPRCO1
                WHEN EDO.TIDO IN ({menos}) THEN -DDO.CAPRCO1
-          END) AS flujo_neto
+          END) AS flujo_neto,
+      SUM(CASE WHEN EDO.TIDO IN ({_lista_sql(cfg.tido_compra)}) THEN DDO.CAPRCO1
+               WHEN EDO.TIDO IN ({_lista_sql(cfg.tido_compra_neg)}) THEN -DDO.CAPRCO1
+          END) AS compras,
+      SUM(CASE WHEN EDO.TIDO IN ({_lista_sql(cfg.tido_salida)}) THEN DDO.CAPRCO1
+               WHEN EDO.TIDO IN ({_lista_sql(cfg.tido_salida_neg)}) THEN -DDO.CAPRCO1
+          END) AS salidas
     FROM dbo.MAEEDO AS EDO WITH (NOLOCK)
     INNER JOIN dbo.MAEDDO AS DDO WITH (NOLOCK) ON EDO.IDMAEEDO = DDO.IDMAEEDO
     WHERE EDO.TIDO IN ({_lista_sql(list(signos))})
@@ -411,6 +427,10 @@ def leer_movimientos_stock(conn, cfg: Config, desde: date,
     df["kopr"] = df["kopr"].astype(str).str.strip()
     df["semana"] = pd.to_datetime(df["semana"]).dt.date
     df["flujo_neto"] = df["flujo_neto"].astype(float)
+    for col in ("compras", "salidas"):
+        # SUM da NULL si ningún documento del grupo cae en el CASE (p. ej. solo GRI)
+        df[col] = (df[col] if col in df else 0.0)
+        df[col] = pd.to_numeric(df[col]).fillna(0.0).astype(float)
     return df
 
 
@@ -965,12 +985,19 @@ def guardar_stock_historico(conn, batch_id: int, bodega: str,
 
     if serie is None or serie.empty:
         return
+
+    def medida(r, col):
+        v = getattr(r, col, None)
+        return None if _nulo(v) is None else round(float(v), 2)
+
     filas = [(batch_id, r.kopr, bodega, r.semana, round(float(r.stock_fin), 2),
-              round(float(r.flujo_neto), 2), r.origen) for r in serie.itertuples()]
+              round(float(r.flujo_neto), 2), r.origen,
+              medida(r, "compras"), medida(r, "salidas")) for r in serie.itertuples()]
     with conn.cursor() as cur:
         execute_values(cur, """
             INSERT INTO predictions.stock_historico
-                (batch_run_id, kopr, bodega, semana, stock_fin, flujo_neto, origen)
+                (batch_run_id, kopr, bodega, semana, stock_fin, flujo_neto, origen,
+                 compras, salidas)
             VALUES %s
         """, filas, page_size=1000)
     conn.commit()
@@ -1165,6 +1192,31 @@ def armar_serie_historica(reconstruido: pd.DataFrame, cierres: pd.DataFrame,
     return base[cols].sort_values(["kopr", "semana"]).reset_index(drop=True)
 
 
+def agregar_compras_salidas(serie: pd.DataFrame, movimientos: pd.DataFrame,
+                            hasta: date) -> pd.DataFrame:
+    """Agrega `compras` y `salidas` semanales a la serie histórica.
+
+    Dentro de la ventana leída (`semana <= hasta`) una semana sin movimiento vale
+    0; después queda NaN (ausencia, no cero). `compras` no baja de cero: una
+    semana con más NCC que FCC no es una compra negativa.
+    """
+    out = serie.copy()
+    cols = ["kopr", "semana", "compras", "salidas"]
+    if movimientos is not None and len(movimientos):
+        mov = movimientos[cols].copy()
+        mov["kopr"] = mov["kopr"].astype(str)
+        mov = mov.groupby(["kopr", "semana"], as_index=False)[["compras", "salidas"]].sum()
+        out = out.merge(mov, on=["kopr", "semana"], how="left")
+    else:
+        out["compras"] = np.nan
+        out["salidas"] = np.nan
+    en_ventana = out["semana"] <= hasta
+    for col in ("compras", "salidas"):
+        out[col] = out[col].where(~en_ventana, out[col].fillna(0.0)).astype(float)
+    out["compras"] = out["compras"].clip(lower=0.0)
+    return out
+
+
 def calidad_stock_historico(df: pd.DataFrame) -> dict:
     """Registra el control de calidad: las semanas con stock negativo."""
     total = len(df)
@@ -1274,12 +1326,16 @@ def generar_stock_historico(conn_pg, batch_id: int, inicio: date, cfg: Config) -
     conn_pg.rollback()  # cierra la transacción de lectura antes de ir a Softland
     skus = set(cfg.skus)
     ancla = dc_replace(ancla, stock={k: v for k, v in ancla.stock.items() if k in skus})
+    # Las semanas capturadas posteriores al ancla también llevan compras y
+    # salidas; la reconstrucción descarta lo que pasa del ancla.
+    hasta = max(ancla.semana, ultima_semana_cerrada())
     with conectar_mssql() as cx:
-        movimientos = leer_movimientos_stock(cx, cfg, inicio, ancla.semana)
+        movimientos = leer_movimientos_stock(cx, cfg, inicio, hasta)
     reconstruido = reconstruir_stock_historico(ancla, movimientos, cfg, inicio)
     calidad_stock_historico(reconstruido)
     cierres = cierres_semanales(leer_capturas(conn_pg, cfg), cfg)
     serie = armar_serie_historica(reconstruido, cierres, ancla)
+    serie = agregar_compras_salidas(serie, movimientos, hasta)
     guardar_stock_historico(conn_pg, batch_id, cfg.bodega, serie)
     log.info("Stock histórico: %d filas guardadas (ancla %s)", len(serie), ancla.semana)
     return len(serie)
