@@ -118,6 +118,10 @@ class Config:
     tido_salida: tuple[str, ...] = ("FCV", "FDV", "GDI")       # restan stock
     tido_entrada_neg: tuple[str, ...] = ("NCC",)  # devolución de compra: resta
     tido_salida_neg: tuple[str, ...] = ("NCV",)   # devolución de venta: suma
+    # Recepciones del proveedor para el panel de compras: subconjunto de las
+    # entradas (GRI y GAR no son compras).
+    tido_compra: tuple[str, ...] = ("FCC",)
+    tido_compra_neg: tuple[str, ...] = ("NCC",)
     zona_horaria: str = "America/Santiago"  # para ubicar "lunes de madrugada"
     hora_madrugada_max: int = 6      # capturas locales antes de esta hora cuentan como cierre
 
@@ -162,6 +166,12 @@ class Config:
                     raise ValueError(
                         f"{a} y {b_} no pueden compartir tipos de documento "
                         f"{sorted(comunes)}: el stock se contaría doble")
+        if not set(self.tido_compra) <= set(self.tido_entrada):
+            raise ValueError(f"tido_compra {self.tido_compra} debe ser subconjunto "
+                             f"de tido_entrada {self.tido_entrada}")
+        if not set(self.tido_compra_neg) <= set(self.tido_entrada_neg):
+            raise ValueError(f"tido_compra_neg {self.tido_compra_neg} debe ser "
+                             f"subconjunto de tido_entrada_neg {self.tido_entrada_neg}")
         p, d, q = self.orden_arima
         self.nombre_modelo = f"ARIMA({p},{d},{q})"
 
@@ -391,7 +401,13 @@ def _query_movimientos(cfg: Config, desde: date, hasta_excl: date) -> str:
       {lunes} AS semana,
       SUM(CASE WHEN EDO.TIDO IN ({mas}) THEN DDO.CAPRCO1
                WHEN EDO.TIDO IN ({menos}) THEN -DDO.CAPRCO1
-          END) AS flujo_neto
+          END) AS flujo_neto,
+      SUM(CASE WHEN EDO.TIDO IN ({_lista_sql(cfg.tido_compra)}) THEN DDO.CAPRCO1
+               WHEN EDO.TIDO IN ({_lista_sql(cfg.tido_compra_neg)}) THEN -DDO.CAPRCO1
+          END) AS compras,
+      SUM(CASE WHEN EDO.TIDO IN ({_lista_sql(cfg.tido_salida)}) THEN DDO.CAPRCO1
+               WHEN EDO.TIDO IN ({_lista_sql(cfg.tido_salida_neg)}) THEN -DDO.CAPRCO1
+          END) AS salidas
     FROM dbo.MAEEDO AS EDO WITH (NOLOCK)
     INNER JOIN dbo.MAEDDO AS DDO WITH (NOLOCK) ON EDO.IDMAEEDO = DDO.IDMAEEDO
     WHERE EDO.TIDO IN ({_lista_sql(list(signos))})
@@ -411,6 +427,10 @@ def leer_movimientos_stock(conn, cfg: Config, desde: date,
     df["kopr"] = df["kopr"].astype(str).str.strip()
     df["semana"] = pd.to_datetime(df["semana"]).dt.date
     df["flujo_neto"] = df["flujo_neto"].astype(float)
+    for col in ("compras", "salidas"):
+        # SUM da NULL si ningún documento del grupo cae en el CASE (p. ej. solo GRI)
+        df[col] = (df[col] if col in df else 0.0)
+        df[col] = pd.to_numeric(df[col]).fillna(0.0).astype(float)
     return df
 
 
