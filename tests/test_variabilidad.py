@@ -1,3 +1,4 @@
+import re
 import sys
 from pathlib import Path
 
@@ -20,8 +21,7 @@ COLUMNAS_009 = [
 def test_migracion_009_forma():
     sql = (RAIZ / "sql" / "009_metricas_variabilidad.sql").read_text(encoding="utf-8")
     for col, tipo in COLUMNAS_009:
-        assert f"ADD COLUMN IF NOT EXISTS {col}" in sql
-        assert tipo in sql
+        assert re.search(rf"ADD COLUMN IF NOT EXISTS {col}\s+{re.escape(tipo)}\s*[,;]", sql)
     assert sql.count("COMMENT ON COLUMN predictions.metrica_sku.") == 8
     assert "NOT NULL" not in sql
     assert "DEFAULT" not in sql.upper()
@@ -30,3 +30,13 @@ def test_migracion_009_forma():
     assert "coeficientes de variacion" in sql
     assert "NO es Var(stock)/Var(demanda)" in sql
     assert sql.strip().upper().rstrip(";").endswith("COMMIT")
+
+
+def test_migracion_009_cada_comentario_explica_el_null():
+    sql = (RAIZ / "sql" / "009_metricas_variabilidad.sql").read_text(encoding="utf-8")
+    comentarios = re.findall(
+        r"COMMENT ON COLUMN predictions\.metrica_sku\.(\w+) IS\s+'([^']*)'", sql)
+    assert [c for c, _ in comentarios] == [c for c, _ in COLUMNAS_009]
+    for col, texto in comentarios:
+        assert "sin serie de stock" in texto, col
+        assert "NULL = no calculable, no cero" in texto, col
