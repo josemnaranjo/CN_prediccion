@@ -1245,6 +1245,77 @@ def calidad_stock_historico(df: pd.DataFrame) -> dict:
     return {"semanas": total, "negativas": len(neg), "pct": pct}
 
 
+# ============================================================================
+# Variabilidad del inventario
+# ============================================================================
+# Se guardan las piezas (CV de cada lado, medias, quiebres) y el cociente, para
+# saber cuál de los dos lados se movió cuando el cociente cambia. El cociente
+# es de coeficientes de variación, NO de varianzas: ese crece con el cuadrado
+# del nivel y no es interpretable.
+
+COLUMNAS_VARIABILIDAD = (
+    "cv_demanda", "cv_stock", "ratio_variabilidad", "media_demanda",
+    "media_stock", "tasa_quiebre", "semanas_variabilidad", "prop_stock_reconstruido",
+)
+RATIO_MAXIMO = 9999.9999   # límite de NUMERIC(8,4)
+
+
+def _cv(x: pd.Series) -> float | None:
+    """Desviación estándar muestral / media; None si la media no es positiva."""
+    media = x.mean()
+    if not media > 0:
+        return None
+    return round(float(x.std(ddof=1) / media), 4)
+
+
+def calcular_variabilidad(datos: pd.DataFrame, stock_hist: pd.DataFrame | None,
+                          cfg: Config = CONFIG) -> dict[str, dict]:
+    """Medidas de variabilidad por SKU sobre las últimas `semanas_variabilidad`.
+
+    Alinea la demanda cruda (`datos`) con el stock reconstruido (`stock_hist`)
+    por semana. Las semanas en quiebre quedan dentro en ambos lados. Con menos
+    de `min_semanas_variabilidad` semanas comunes, o sin serie de stock, las
+    ocho medidas de ese SKU van en None. Los valores salen redondeados a la
+    precisión de su columna en la base.
+    """
+    out = {str(k): dict.fromkeys(COLUMNAS_VARIABILIDAD) for k in datos["kopr"].unique()}
+    if stock_hist is None or stock_hist.empty or datos.empty:
+        return out
+
+    fin = datos["semana"].max()
+    desde = fin - timedelta(weeks=cfg.semanas_variabilidad - 1)
+    d = datos[["kopr", "semana", "demanda_cruda"]].assign(kopr=lambda t: t["kopr"].astype(str))
+    st = (stock_hist[["kopr", "semana", "stock_fin", "origen"]]
+          .assign(kopr=lambda t: t["kopr"].astype(str))
+          .drop_duplicates(["kopr", "semana"], keep="last"))
+    juntas = d.merge(st, on=["kopr", "semana"], how="inner")
+    juntas = juntas[(juntas["semana"] >= desde) & (juntas["semana"] <= fin)]
+    juntas = juntas.dropna(subset=["demanda_cruda", "stock_fin"])
+
+    for kopr, g in juntas.groupby("kopr"):
+        if len(g) < cfg.min_semanas_variabilidad:
+            continue
+        demanda = g["demanda_cruda"].astype(float)
+        stock = g["stock_fin"].astype(float)
+        cv_d, cv_s = _cv(demanda), _cv(stock)
+        ratio = None
+        if cv_d and cv_s is not None:
+            ratio = round(cv_s / cv_d, 4)
+            if ratio > RATIO_MAXIMO:
+                ratio = None
+        out[kopr] = {
+            "cv_demanda": cv_d,
+            "cv_stock": cv_s,
+            "ratio_variabilidad": ratio,
+            "media_demanda": round(float(demanda.mean()), 2),
+            "media_stock": round(float(stock.mean()), 2),
+            "tasa_quiebre": round(float((stock <= 0).mean()), 4),
+            "semanas_variabilidad": int(len(g)),
+            "prop_stock_reconstruido": round(float((g["origen"] == "reconstruido").mean()), 4),
+        }
+    return out
+
+
 def armar_filas_serie(tratado: pd.DataFrame, resultados: list[dict]) -> list[tuple]:
     """Convierte las tres series al formato de predictions.serie_semanal."""
     filas: list[tuple] = []
