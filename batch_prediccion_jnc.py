@@ -140,6 +140,14 @@ class Config:
     factor_bonif_maximo: float = 0.60    # sobre esto, solo advierte
     umbral_deriva_factor: float = 0.10   # |factor13 - factor52| sobre esto, advierte
 
+    # --- Variabilidad del inventario ----------------------------------------
+    # Coeficiente de variación del stock y de la demanda cruda por SKU, sobre
+    # las últimas semanas cerradas. Es un dato paralelo: no entra al modelo ni
+    # a las métricas de error. Con menos de `min_semanas_variabilidad` semanas
+    # con dato, las medidas se guardan en NULL.
+    semanas_variabilidad: int = 52
+    min_semanas_variabilidad: int = 40
+
     nombre_modelo: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -150,6 +158,10 @@ class Config:
                 f"semanas_evaluacion ({self.semanas_evaluacion})")
         if self.semanas_refit <= 0:
             raise ValueError(f"semanas_refit ({self.semanas_refit}) debe ser > 0")
+        if not 2 <= self.min_semanas_variabilidad <= self.semanas_variabilidad:
+            raise ValueError(
+                f"min_semanas_variabilidad ({self.min_semanas_variabilidad}) debe estar "
+                f"entre 2 y semanas_variabilidad ({self.semanas_variabilidad})")
         if set(self.tido_bonificacion) & set(TIPOS_VENTA):
             raise ValueError(
                 f"tido_bonificacion {self.tido_bonificacion} no puede incluir "
@@ -1032,13 +1044,17 @@ def guardar_metricas(conn, batch_id: int, metricas: list[dict]) -> None:
     filas = [(batch_id, m["kopr"], m["semanas_backtest"], m["semanas_para_mape"],
               m["semanas_censuradas"], _nulo(m["mape_semanal"]),
               _nulo(m["mae_semanal"]), _nulo(m["mape_4sem"]),
-              m["bloques_4sem"], m["en_quiebre"], _factor(m)) for m in metricas]
+              m["bloques_4sem"], m["en_quiebre"], _factor(m),
+              *(_nulo(m.get(col)) for col in COLUMNAS_VARIABILIDAD)) for m in metricas]
     with conn.cursor() as cur:
         execute_values(cur, """
             INSERT INTO predictions.metrica_sku
                 (batch_run_id, kopr, semanas_backtest, semanas_para_mape,
                  semanas_censuradas, mape_semanal, mae_semanal, mape_4sem,
-                 bloques_4sem, en_quiebre, factor_bonificacion)
+                 bloques_4sem, en_quiebre, factor_bonificacion,
+                 cv_demanda, cv_stock, ratio_variabilidad, media_demanda,
+                 media_stock, tasa_quiebre, semanas_variabilidad,
+                 prop_stock_reconstruido)
             VALUES %s
         """, filas)
     conn.commit()
@@ -1233,6 +1249,98 @@ def calidad_stock_historico(df: pd.DataFrame) -> dict:
     return {"semanas": total, "negativas": len(neg), "pct": pct}
 
 
+# ============================================================================
+# Variabilidad del inventario
+# ============================================================================
+# Se guardan las piezas (CV de cada lado, medias, quiebres) y el cociente, para
+# saber cuál de los dos lados se movió cuando el cociente cambia. El cociente
+# es de coeficientes de variación, NO de varianzas: ese crece con el cuadrado
+# del nivel y no es interpretable.
+
+COLUMNAS_VARIABILIDAD = (
+    "cv_demanda", "cv_stock", "ratio_variabilidad", "media_demanda",
+    "media_stock", "tasa_quiebre", "semanas_variabilidad", "prop_stock_reconstruido",
+)
+RATIO_MAXIMO = 9999.9999   # límite de NUMERIC(8,4), en los CV y en el cociente
+
+
+def _cv(x: pd.Series) -> float | None:
+    """Desviación estándar muestral / media.
+
+    None si la media no es positiva o si el CV no cabe en la columna: con el
+    stock reconstruido puede haber una media positiva casi nula, y un valor
+    que desborda haría fallar el INSERT de toda la corrida.
+    """
+    media = x.mean()
+    if not media > 0:
+        return None
+    cv = round(float(x.std(ddof=1) / media), 4)
+    return cv if cv <= RATIO_MAXIMO else None
+
+
+def calcular_variabilidad(datos: pd.DataFrame, stock_hist: pd.DataFrame | None,
+                          cfg: Config = CONFIG) -> dict[str, dict]:
+    """Medidas de variabilidad por SKU sobre las últimas `semanas_variabilidad`.
+
+    Alinea la demanda cruda (`datos`) con el stock reconstruido (`stock_hist`)
+    por semana. Las semanas en quiebre quedan dentro en ambos lados. Con menos
+    de `min_semanas_variabilidad` semanas comunes, o sin serie de stock, las
+    ocho medidas de ese SKU van en None. Los valores salen redondeados a la
+    precisión de su columna en la base.
+    """
+    out = {str(k): dict.fromkeys(COLUMNAS_VARIABILIDAD) for k in datos["kopr"].unique()}
+    if stock_hist is None or stock_hist.empty or datos.empty:
+        return out
+
+    fin = datos["semana"].max()
+    desde = fin - timedelta(weeks=cfg.semanas_variabilidad - 1)
+    d = datos[["kopr", "semana", "demanda_cruda"]].assign(kopr=lambda t: t["kopr"].astype(str))
+    st = (stock_hist[["kopr", "semana", "stock_fin", "origen"]]
+          .assign(kopr=lambda t: t["kopr"].astype(str))
+          .drop_duplicates(["kopr", "semana"], keep="last"))
+    juntas = d.merge(st, on=["kopr", "semana"], how="inner")
+    juntas = juntas[(juntas["semana"] >= desde) & (juntas["semana"] <= fin)]
+    juntas = juntas.dropna(subset=["demanda_cruda", "stock_fin"])
+
+    for kopr, g in juntas.groupby("kopr"):
+        if len(g) < cfg.min_semanas_variabilidad:
+            continue
+        demanda = g["demanda_cruda"].astype(float)
+        stock = g["stock_fin"].astype(float)
+        cv_d, cv_s = _cv(demanda), _cv(stock)
+        ratio = None
+        if cv_d and cv_s is not None:
+            ratio = round(cv_s / cv_d, 4)
+            if ratio > RATIO_MAXIMO:
+                ratio = None
+        out[kopr] = {
+            "cv_demanda": cv_d,
+            "cv_stock": cv_s,
+            "ratio_variabilidad": ratio,
+            "media_demanda": round(float(demanda.mean()), 2),
+            "media_stock": round(float(stock.mean()), 2),
+            "tasa_quiebre": round(float((stock <= 0).mean()), 4),
+            "semanas_variabilidad": int(len(g)),
+            "prop_stock_reconstruido": round(float((g["origen"] == "reconstruido").mean()), 4),
+        }
+    return out
+
+
+def resumen_variabilidad(metricas: list[dict], cfg: Config = CONFIG) -> None:
+    """Una línea de log: SKUs con dato, ratio mediano y quiebre medio.
+
+    No advierte por valores altos: todavía no hay un umbral fundado.
+    """
+    con_dato = [m for m in metricas if m.get("semanas_variabilidad") is not None]
+    ratios = [m["ratio_variabilidad"] for m in con_dato
+              if m.get("ratio_variabilidad") is not None]
+    quiebres = [m["tasa_quiebre"] for m in con_dato if m.get("tasa_quiebre") is not None]
+    ratio = f"{float(np.median(ratios)):.2f}" if ratios else "n/d"
+    quiebre = f"{100 * float(np.mean(quiebres)):.1f}%" if quiebres else "n/d"
+    log.info("Variabilidad (%d semanas): %d de %d SKUs, ratio mediano %s, quiebre medio %s",
+             cfg.semanas_variabilidad, len(con_dato), len(metricas), ratio, quiebre)
+
+
 def armar_filas_serie(tratado: pd.DataFrame, resultados: list[dict]) -> list[tuple]:
     """Convierte las tres series al formato de predictions.serie_semanal."""
     filas: list[tuple] = []
@@ -1317,12 +1425,16 @@ def resumen_cobertura(resultados: list[dict], stock: pd.DataFrame,
                     ", ".join(f"{k} ({c:.1f})" for k, c in criticos))
 
 
-def generar_stock_historico(conn_pg, batch_id: int, inicio: date, cfg: Config) -> int:
-    """Reconstruye y guarda la serie histórica de stock. Devuelve las filas guardadas."""
+def generar_stock_historico(conn_pg, batch_id: int, inicio: date,
+                            cfg: Config) -> pd.DataFrame | None:
+    """Reconstruye y guarda la serie histórica de stock.
+
+    Devuelve la serie guardada, o None si no hay captura de cierre utilizable.
+    """
     ancla = elegir_ancla(conn_pg, cfg)
     if ancla is None:
         log.warning("Stock histórico: no hay captura de cierre utilizable; se omite")
-        return 0
+        return None
     conn_pg.rollback()  # cierra la transacción de lectura antes de ir a Softland
     skus = set(cfg.skus)
     ancla = dc_replace(ancla, stock={k: v for k, v in ancla.stock.items() if k in skus})
@@ -1338,7 +1450,7 @@ def generar_stock_historico(conn_pg, batch_id: int, inicio: date, cfg: Config) -
     serie = agregar_compras_salidas(serie, movimientos, hasta)
     guardar_stock_historico(conn_pg, batch_id, cfg.bodega, serie)
     log.info("Stock histórico: %d filas guardadas (ancla %s)", len(serie), ancla.semana)
-    return len(serie)
+    return serie
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1462,13 +1574,13 @@ def main(argv: list[str] | None = None) -> int:
             guardar_productos(conn, productos, clusters)
         guardar_stock(conn, batch_id, stock)
         guardar_serie(conn, batch_id, armar_filas_serie(datos, resultados))
-        guardar_metricas(conn, batch_id, [r["metricas"] | {"kopr": r["kopr"]}
-                                          for r in resultados])
+        # El histórico va antes de las métricas: la variabilidad necesita su serie.
+        serie_stock = None
         if cfg.reconstruir_stock and args.csv:
             log.info("Stock histórico omitido: --desde-csv no tiene conexión a Softland")
         elif cfg.reconstruir_stock:
             try:
-                generar_stock_historico(conn, batch_id, inicio, cfg)
+                serie_stock = generar_stock_historico(conn, batch_id, inicio, cfg)
             except Exception:  # noqa: BLE001 — el histórico no debe tumbar la corrida
                 log.exception("Stock histórico falló; la corrida %d sigue como ok", batch_id)
                 try:  # una transacción abortada rompería cerrar_corrida
@@ -1478,6 +1590,16 @@ def main(argv: list[str] | None = None) -> int:
                 if getattr(conn, "closed", 0):
                     log.warning("Conexión PostgreSQL cerrada; se reconecta para cerrar la corrida")
                     conn = conectar_postgres()
+
+        metricas = [r["metricas"] | {"kopr": r["kopr"]} for r in resultados]
+        try:
+            variabilidad = calcular_variabilidad(datos, serie_stock, cfg)
+            for m in metricas:
+                m.update(variabilidad.get(m["kopr"], {}))
+            resumen_variabilidad(metricas, cfg)
+        except Exception:  # noqa: BLE001 — la variabilidad no debe tumbar la corrida
+            log.exception("Variabilidad falló; las métricas se guardan sin ella")
+        guardar_metricas(conn, batch_id, metricas)
         cerrar_corrida(conn, batch_id, "ok", len(resultados), len(fallidos),
                        time.time() - t0)
         log.info("Corrida %d guardada.", batch_id)

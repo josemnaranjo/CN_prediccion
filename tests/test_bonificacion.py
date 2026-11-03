@@ -205,7 +205,7 @@ def test_guardar_metricas_persiste_el_factor(monkeypatch):
                                  _metrica("B", factor_bonificacion=None),
                                  _metrica("C")])          # sin la clave: NULL
     assert "factor_bonificacion" in capturado["sql"]
-    assert [f[-1] for f in capturado["filas"]] == [0.2612, None, None]
+    assert [f[10] for f in capturado["filas"]] == [0.2612, None, None]
     assert conn.store["commit"] is True
 
 
