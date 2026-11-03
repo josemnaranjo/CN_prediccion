@@ -487,7 +487,8 @@ def corrida(monkeypatch):
                         lambda conn, bid, estado, *a, **k: eventos.append(("cerrar", estado)))
     monkeypatch.setattr(bp, "generar_stock_historico",
                         lambda conn, bid, ini, c: eventos.append(("historico", bid, ini))
-                        or pd.DataFrame({"kopr": ["A"]}))
+                        or pd.DataFrame({"kopr": ["A"], "semana": [date(2025, 1, 13)],
+                                         "stock_fin": [1.0], "origen": ["reconstruido"]}))
     return eventos, cfg
 
 
@@ -499,9 +500,10 @@ def test_main_con_reconstruir_stock_false_no_llama_nada(corrida):
     assert ("cerrar", "ok") in eventos
 
 
-def test_main_reconstruye_antes_de_las_metricas(corrida):
+def test_main_reconstruye_antes_de_las_metricas(corrida, caplog):
     eventos, _ = corrida
     assert bp.main([]) == 0
+    assert "Variabilidad falló" not in caplog.text   # el cálculo real corre sin error
     assert eventos.index(("historico", 99, date(2025, 1, 6))) < eventos.index("metricas") \
         < eventos.index(("cerrar", "ok"))
 

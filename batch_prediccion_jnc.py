@@ -1261,15 +1261,21 @@ COLUMNAS_VARIABILIDAD = (
     "cv_demanda", "cv_stock", "ratio_variabilidad", "media_demanda",
     "media_stock", "tasa_quiebre", "semanas_variabilidad", "prop_stock_reconstruido",
 )
-RATIO_MAXIMO = 9999.9999   # límite de NUMERIC(8,4)
+RATIO_MAXIMO = 9999.9999   # límite de NUMERIC(8,4), en los CV y en el cociente
 
 
 def _cv(x: pd.Series) -> float | None:
-    """Desviación estándar muestral / media; None si la media no es positiva."""
+    """Desviación estándar muestral / media.
+
+    None si la media no es positiva o si el CV no cabe en la columna: con el
+    stock reconstruido puede haber una media positiva casi nula, y un valor
+    que desborda haría fallar el INSERT de toda la corrida.
+    """
     media = x.mean()
     if not media > 0:
         return None
-    return round(float(x.std(ddof=1) / media), 4)
+    cv = round(float(x.std(ddof=1) / media), 4)
+    return cv if cv <= RATIO_MAXIMO else None
 
 
 def calcular_variabilidad(datos: pd.DataFrame, stock_hist: pd.DataFrame | None,

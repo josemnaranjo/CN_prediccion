@@ -383,3 +383,12 @@ def test_main_sin_historico_guarda_nulls(corrida, monkeypatch, argv, reconstruir
     assert bp.main(argv) == 0
     assert _todas_nulas(guardado["metricas"])
     assert ("cerrar", "ok") in eventos
+
+
+def test_variabilidad_cv_que_no_cabe_va_en_none():
+    d = _alterna(52, 10, 30)
+    r = _calc(*_series(d, _alterna(52, -100.0, 100.02)))["A"]   # media 0.01, CV ~ 10098
+    assert r["media_stock"] == 0.01
+    assert r["cv_stock"] is None
+    assert r["ratio_variabilidad"] is None
+    assert r["cv_demanda"] == 0.5049
