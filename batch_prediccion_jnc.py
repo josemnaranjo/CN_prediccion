@@ -1044,13 +1044,17 @@ def guardar_metricas(conn, batch_id: int, metricas: list[dict]) -> None:
     filas = [(batch_id, m["kopr"], m["semanas_backtest"], m["semanas_para_mape"],
               m["semanas_censuradas"], _nulo(m["mape_semanal"]),
               _nulo(m["mae_semanal"]), _nulo(m["mape_4sem"]),
-              m["bloques_4sem"], m["en_quiebre"], _factor(m)) for m in metricas]
+              m["bloques_4sem"], m["en_quiebre"], _factor(m),
+              *(_nulo(m.get(col)) for col in COLUMNAS_VARIABILIDAD)) for m in metricas]
     with conn.cursor() as cur:
         execute_values(cur, """
             INSERT INTO predictions.metrica_sku
                 (batch_run_id, kopr, semanas_backtest, semanas_para_mape,
                  semanas_censuradas, mape_semanal, mae_semanal, mape_4sem,
-                 bloques_4sem, en_quiebre, factor_bonificacion)
+                 bloques_4sem, en_quiebre, factor_bonificacion,
+                 cv_demanda, cv_stock, ratio_variabilidad, media_demanda,
+                 media_stock, tasa_quiebre, semanas_variabilidad,
+                 prop_stock_reconstruido)
             VALUES %s
         """, filas)
     conn.commit()
@@ -1314,6 +1318,21 @@ def calcular_variabilidad(datos: pd.DataFrame, stock_hist: pd.DataFrame | None,
             "prop_stock_reconstruido": round(float((g["origen"] == "reconstruido").mean()), 4),
         }
     return out
+
+
+def resumen_variabilidad(metricas: list[dict], cfg: Config = CONFIG) -> None:
+    """Una línea de log: SKUs con dato, ratio mediano y quiebre medio.
+
+    No advierte por valores altos: todavía no hay un umbral fundado.
+    """
+    con_dato = [m for m in metricas if m.get("semanas_variabilidad") is not None]
+    ratios = [m["ratio_variabilidad"] for m in con_dato
+              if m.get("ratio_variabilidad") is not None]
+    quiebres = [m["tasa_quiebre"] for m in con_dato if m.get("tasa_quiebre") is not None]
+    ratio = f"{float(np.median(ratios)):.2f}" if ratios else "n/d"
+    quiebre = f"{100 * float(np.mean(quiebres)):.1f}%" if quiebres else "n/d"
+    log.info("Variabilidad (%d semanas): %d de %d SKUs, ratio mediano %s, quiebre medio %s",
+             cfg.semanas_variabilidad, len(con_dato), len(metricas), ratio, quiebre)
 
 
 def armar_filas_serie(tratado: pd.DataFrame, resultados: list[dict]) -> list[tuple]:

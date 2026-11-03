@@ -220,3 +220,68 @@ def test_variabilidad_varios_skus_independientes():
     r = _calc(pd.concat([da, db], ignore_index=True), pd.concat([ha, hb], ignore_index=True))
     assert r["A"]["ratio_variabilidad"] == 1.0
     assert all(v is None for v in r["B"].values())
+
+
+# ---------------------------------------------------------------------------
+# Task 3: persistencia y línea de log
+# ---------------------------------------------------------------------------
+class _FakeCursor:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+class _FakeConn:
+    committed = False
+    def cursor(self): return _FakeCursor()
+    def commit(self): self.committed = True
+
+
+def _metrica(kopr, **extra):
+    base = {"kopr": kopr, "semanas_backtest": 12, "semanas_para_mape": 12,
+            "semanas_censuradas": 0, "mape_semanal": 20.0, "mae_semanal": 5.0,
+            "mape_4sem": 15.0, "bloques_4sem": 3, "en_quiebre": False}
+    return base | extra
+
+
+MEDIDAS = {"cv_demanda": 0.5, "cv_stock": 0.7, "ratio_variabilidad": 1.4,
+           "media_demanda": 20.0, "media_stock": 40.0, "tasa_quiebre": 0.06,
+           "semanas_variabilidad": 52, "prop_stock_reconstruido": 1.0}
+
+
+def test_guardar_metricas_persiste_la_variabilidad(monkeypatch):
+    import psycopg2.extras
+    capturado = {}
+    monkeypatch.setattr(psycopg2.extras, "execute_values",
+                        lambda cur, sql, filas, **k: capturado.update(sql=sql, filas=filas))
+    conn = _FakeConn()
+    bp.guardar_metricas(conn, 7, [_metrica("A", **MEDIDAS),
+                                  _metrica("B"),                                  # sin claves
+                                  _metrica("C", **(MEDIDAS | {"cv_stock": float("nan")}))])
+    for col in bp.COLUMNAS_VARIABILIDAD:
+        assert col in capturado["sql"]
+    a, b, c = capturado["filas"]
+    assert a[11:] == tuple(MEDIDAS[col] for col in bp.COLUMNAS_VARIABILIDAD)
+    assert b[11:] == (None,) * 8
+    assert c[12] is None                      # NaN -> NULL
+    assert conn.committed
+
+
+def test_resumen_variabilidad_linea(caplog):
+    con_dato = [_metrica(f"S{i}", **(MEDIDAS | {"ratio_variabilidad": 1.35,
+                                                "tasa_quiebre": 0.059})) for i in range(20)]
+    sin_ratio = _metrica("S20", **(MEDIDAS | {"ratio_variabilidad": None,
+                                              "tasa_quiebre": 0.059}))
+    sin_dato = _metrica("S21", **dict.fromkeys(bp.COLUMNAS_VARIABILIDAD))
+    with caplog.at_level("INFO"):
+        bp.resumen_variabilidad(con_dato + [sin_ratio, sin_dato], Config())
+    assert ("Variabilidad (52 semanas): 21 de 22 SKUs, ratio mediano 1.35, "
+            "quiebre medio 5.9%") in caplog.text
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_resumen_variabilidad_sin_datos(caplog):
+    metricas = [_metrica(f"S{i}") for i in range(22)]
+    with caplog.at_level("INFO"):
+        bp.resumen_variabilidad(metricas, Config())
+    assert ("Variabilidad (52 semanas): 0 de 22 SKUs, ratio mediano n/d, "
+            "quiebre medio n/d") in caplog.text
