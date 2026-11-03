@@ -40,3 +40,25 @@ def test_migracion_009_cada_comentario_explica_el_null():
     for col, texto in comentarios:
         assert "sin serie de stock" in texto, col
         assert "NULL = no calculable, no cero" in texto, col
+
+
+# ---------------------------------------------------------------------------
+# Task 1: Config
+# ---------------------------------------------------------------------------
+import pytest
+
+import batch_prediccion_jnc as bp
+from batch_prediccion_jnc import Config
+
+
+def test_config_variabilidad():
+    c = Config()
+    assert c.semanas_variabilidad == 52
+    assert c.min_semanas_variabilidad == 40
+
+
+def test_config_variabilidad_invalida():
+    with pytest.raises(ValueError):
+        Config(min_semanas_variabilidad=53)
+    with pytest.raises(ValueError):
+        Config(min_semanas_variabilidad=1)

@@ -140,6 +140,14 @@ class Config:
     factor_bonif_maximo: float = 0.60    # sobre esto, solo advierte
     umbral_deriva_factor: float = 0.10   # |factor13 - factor52| sobre esto, advierte
 
+    # --- Variabilidad del inventario ----------------------------------------
+    # Coeficiente de variación del stock y de la demanda cruda por SKU, sobre
+    # las últimas semanas cerradas. Es un dato paralelo: no entra al modelo ni
+    # a las métricas de error. Con menos de `min_semanas_variabilidad` semanas
+    # con dato, las medidas se guardan en NULL.
+    semanas_variabilidad: int = 52
+    min_semanas_variabilidad: int = 40
+
     nombre_modelo: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -150,6 +158,10 @@ class Config:
                 f"semanas_evaluacion ({self.semanas_evaluacion})")
         if self.semanas_refit <= 0:
             raise ValueError(f"semanas_refit ({self.semanas_refit}) debe ser > 0")
+        if not 2 <= self.min_semanas_variabilidad <= self.semanas_variabilidad:
+            raise ValueError(
+                f"min_semanas_variabilidad ({self.min_semanas_variabilidad}) debe estar "
+                f"entre 2 y semanas_variabilidad ({self.semanas_variabilidad})")
         if set(self.tido_bonificacion) & set(TIPOS_VENTA):
             raise ValueError(
                 f"tido_bonificacion {self.tido_bonificacion} no puede incluir "
