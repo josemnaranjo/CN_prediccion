@@ -1419,12 +1419,16 @@ def resumen_cobertura(resultados: list[dict], stock: pd.DataFrame,
                     ", ".join(f"{k} ({c:.1f})" for k, c in criticos))
 
 
-def generar_stock_historico(conn_pg, batch_id: int, inicio: date, cfg: Config) -> int:
-    """Reconstruye y guarda la serie histórica de stock. Devuelve las filas guardadas."""
+def generar_stock_historico(conn_pg, batch_id: int, inicio: date,
+                            cfg: Config) -> pd.DataFrame | None:
+    """Reconstruye y guarda la serie histórica de stock.
+
+    Devuelve la serie guardada, o None si no hay captura de cierre utilizable.
+    """
     ancla = elegir_ancla(conn_pg, cfg)
     if ancla is None:
         log.warning("Stock histórico: no hay captura de cierre utilizable; se omite")
-        return 0
+        return None
     conn_pg.rollback()  # cierra la transacción de lectura antes de ir a Softland
     skus = set(cfg.skus)
     ancla = dc_replace(ancla, stock={k: v for k, v in ancla.stock.items() if k in skus})
@@ -1440,7 +1444,7 @@ def generar_stock_historico(conn_pg, batch_id: int, inicio: date, cfg: Config) -
     serie = agregar_compras_salidas(serie, movimientos, hasta)
     guardar_stock_historico(conn_pg, batch_id, cfg.bodega, serie)
     log.info("Stock histórico: %d filas guardadas (ancla %s)", len(serie), ancla.semana)
-    return len(serie)
+    return serie
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1564,13 +1568,13 @@ def main(argv: list[str] | None = None) -> int:
             guardar_productos(conn, productos, clusters)
         guardar_stock(conn, batch_id, stock)
         guardar_serie(conn, batch_id, armar_filas_serie(datos, resultados))
-        guardar_metricas(conn, batch_id, [r["metricas"] | {"kopr": r["kopr"]}
-                                          for r in resultados])
+        # El histórico va antes de las métricas: la variabilidad necesita su serie.
+        serie_stock = None
         if cfg.reconstruir_stock and args.csv:
             log.info("Stock histórico omitido: --desde-csv no tiene conexión a Softland")
         elif cfg.reconstruir_stock:
             try:
-                generar_stock_historico(conn, batch_id, inicio, cfg)
+                serie_stock = generar_stock_historico(conn, batch_id, inicio, cfg)
             except Exception:  # noqa: BLE001 — el histórico no debe tumbar la corrida
                 log.exception("Stock histórico falló; la corrida %d sigue como ok", batch_id)
                 try:  # una transacción abortada rompería cerrar_corrida
@@ -1580,6 +1584,16 @@ def main(argv: list[str] | None = None) -> int:
                 if getattr(conn, "closed", 0):
                     log.warning("Conexión PostgreSQL cerrada; se reconecta para cerrar la corrida")
                     conn = conectar_postgres()
+
+        metricas = [r["metricas"] | {"kopr": r["kopr"]} for r in resultados]
+        try:
+            variabilidad = calcular_variabilidad(datos, serie_stock, cfg)
+            for m in metricas:
+                m.update(variabilidad.get(m["kopr"], {}))
+            resumen_variabilidad(metricas, cfg)
+        except Exception:  # noqa: BLE001 — la variabilidad no debe tumbar la corrida
+            log.exception("Variabilidad falló; las métricas se guardan sin ella")
+        guardar_metricas(conn, batch_id, metricas)
         cerrar_corrida(conn, batch_id, "ok", len(resultados), len(fallidos),
                        time.time() - t0)
         log.info("Corrida %d guardada.", batch_id)

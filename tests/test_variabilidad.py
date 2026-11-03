@@ -285,3 +285,101 @@ def test_resumen_variabilidad_sin_datos(caplog):
         bp.resumen_variabilidad(metricas, Config())
     assert ("Variabilidad (52 semanas): 0 de 22 SKUs, ratio mediano n/d, "
             "quiebre medio n/d") in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Task 4: integración en main
+# ---------------------------------------------------------------------------
+from test_stock_historico import corrida  # noqa: E402,F401  (fixture)
+
+SERIE = pd.DataFrame({"kopr": ["A"], "semana": [date(2026, 10, 26)],
+                      "stock_fin": [1.0], "origen": ["reconstruido"]})
+
+
+@pytest.fixture
+def espiada(corrida, monkeypatch):
+    """`corrida` con las métricas guardadas y la variabilidad registradas."""
+    eventos, cfg = corrida
+    guardado = {}
+    monkeypatch.setattr(bp, "guardar_metricas",
+                        lambda conn, bid, ms: (eventos.append("metricas"),
+                                               guardado.update(metricas=ms)))
+    monkeypatch.setattr(bp, "generar_stock_historico",
+                        lambda conn, bid, ini, c: eventos.append(("historico", bid, ini)) or SERIE)
+
+    def variab(datos, serie, c):
+        eventos.append("variabilidad")
+        guardado["serie"] = serie
+        return {"A": dict(MEDIDAS)}
+    monkeypatch.setattr(bp, "calcular_variabilidad", variab)
+    return eventos, cfg, guardado
+
+
+def _todas_nulas(metricas):
+    return all(m.get(col) is None for m in metricas for col in bp.COLUMNAS_VARIABILIDAD)
+
+
+def test_main_calcula_la_variabilidad_entre_historico_y_metricas(espiada):
+    eventos, _, guardado = espiada
+    assert bp.main([]) == 0
+    assert eventos.index(("historico", 99, date(2025, 1, 6))) < eventos.index("variabilidad") \
+        < eventos.index("metricas") < eventos.index(("cerrar", "ok"))
+    assert guardado["serie"] is SERIE
+
+
+def test_main_pasa_las_ocho_medidas_a_guardar_metricas(espiada):
+    _, _, guardado = espiada
+    assert bp.main([]) == 0
+    (m,) = guardado["metricas"]
+    assert m["kopr"] == "A"
+    assert {col: m[col] for col in bp.COLUMNAS_VARIABILIDAD} == MEDIDAS
+
+
+def test_main_historico_none_deja_las_ocho_en_none(corrida, monkeypatch):
+    eventos, _ = corrida
+    guardado = {}
+    monkeypatch.setattr(bp, "generar_stock_historico", lambda *a, **k: None)
+    monkeypatch.setattr(bp, "guardar_metricas",
+                        lambda conn, bid, ms: guardado.update(metricas=ms))
+    assert bp.main([]) == 0
+    assert _todas_nulas(guardado["metricas"])
+    assert ("cerrar", "ok") in eventos
+
+
+def test_main_excepcion_en_variabilidad_no_cambia_el_estado(espiada, monkeypatch):
+    eventos, _, guardado = espiada
+
+    llamadas = []
+
+    def falla(*a, **k):
+        llamadas.append(1)
+        raise RuntimeError("boom")
+    monkeypatch.setattr(bp, "calcular_variabilidad", falla)
+    assert bp.main([]) == 0
+    assert llamadas == [1]
+    assert "metricas" in eventos and _todas_nulas(guardado["metricas"])
+    assert ("cerrar", "ok") in eventos and ("cerrar", "error") not in eventos
+
+
+def test_main_excepcion_en_historico_sigue_guardando_metricas(espiada, monkeypatch):
+    eventos, _, guardado = espiada
+
+    def falla(*a, **k):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(bp, "generar_stock_historico", falla)
+    assert bp.main([]) == 0
+    assert eventos.index("rollback") < eventos.index("metricas") \
+        < eventos.index(("cerrar", "ok"))
+    assert guardado["serie"] is None
+
+
+@pytest.mark.parametrize("argv, reconstruir", [([], False), (["--desde-csv", "x.csv"], True)])
+def test_main_sin_historico_guarda_nulls(corrida, monkeypatch, argv, reconstruir):
+    eventos, cfg = corrida
+    cfg.reconstruir_stock = reconstruir
+    guardado = {}
+    monkeypatch.setattr(bp, "guardar_metricas",
+                        lambda conn, bid, ms: guardado.update(metricas=ms))
+    assert bp.main(argv) == 0
+    assert _todas_nulas(guardado["metricas"])
+    assert ("cerrar", "ok") in eventos

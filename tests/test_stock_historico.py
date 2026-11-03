@@ -395,7 +395,7 @@ def test_generar_sin_ancla_no_guarda_y_no_falla(monkeypatch):
                         lambda *a, **k: llamadas.append("mov"))
     monkeypatch.setattr(bp, "guardar_stock_historico",
                         lambda *a, **k: llamadas.append("guardar"))
-    assert bp.generar_stock_historico(_Pg(), 7, date(2025, 1, 6), Config()) == 0
+    assert bp.generar_stock_historico(_Pg(), 7, date(2025, 1, 6), Config()) is None
     assert llamadas == []
 
 
@@ -427,7 +427,7 @@ def test_generar_encadena_los_pasos(monkeypatch):
     monkeypatch.setattr(bp, "guardar_stock_historico",
                         lambda conn, bid, bod, s: visto.update(gua=(bid, bod, s)))
 
-    assert bp.generar_stock_historico(_Pg(), 42, inicio, cfg) == 2
+    assert bp.generar_stock_historico(_Pg(), 42, inicio, cfg) is serie
     assert visto["mov"] == (inicio, max(ancla.semana, cerrada))
     assert visto["rec"] == (ancla, "MOV", inicio)
     assert visto["cal"] == "REC"
@@ -486,7 +486,8 @@ def corrida(monkeypatch):
     monkeypatch.setattr(bp, "cerrar_corrida",
                         lambda conn, bid, estado, *a, **k: eventos.append(("cerrar", estado)))
     monkeypatch.setattr(bp, "generar_stock_historico",
-                        lambda conn, bid, ini, c: eventos.append(("historico", bid, ini)) or 3)
+                        lambda conn, bid, ini, c: eventos.append(("historico", bid, ini))
+                        or pd.DataFrame({"kopr": ["A"]}))
     return eventos, cfg
 
 
@@ -498,10 +499,10 @@ def test_main_con_reconstruir_stock_false_no_llama_nada(corrida):
     assert ("cerrar", "ok") in eventos
 
 
-def test_main_reconstruye_entre_metricas_y_cierre(corrida):
+def test_main_reconstruye_antes_de_las_metricas(corrida):
     eventos, _ = corrida
     assert bp.main([]) == 0
-    assert eventos.index("metricas") < eventos.index(("historico", 99, date(2025, 1, 6))) \
+    assert eventos.index(("historico", 99, date(2025, 1, 6))) < eventos.index("metricas") \
         < eventos.index(("cerrar", "ok"))
 
 
